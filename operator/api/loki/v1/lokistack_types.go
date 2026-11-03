@@ -1318,9 +1318,6 @@ type DebugOptionsSpec struct {
 	//
 	GRPCCompression string `json:"grpcCompression,omitempty"`
 
-	// FlushOnShutdown controls whether the ingester will flush all chunks to object storage before shutting down.
-	FlushOnShutdown bool `json:"flushOnShutdown,omitempty"`
-
 	// ResourceOverrides allows overriding default resource requirements per component.
 	// When specified, these overrides take precedence over the t-shirt size defaults for CPU and memory.
 	// PVC storage sizes are not affected and remain as defined by the selected t-shirt size.
