@@ -2065,6 +2065,9 @@ certificates is missing.</p>
 <td><p>ReasonMissingObjectStorageSecret when the required secret to store logs to object
 storage is missing.</p>
 </td>
+</tr><tr><td><p>&#34;MissingPassthroughConfiguration&#34;</p></td>
+<td><p>ReasonMissingPassthroughConfiguration when the passthrough configuration is missing.</p>
+</td>
 </tr><tr><td><p>&#34;MissingRulerSecret&#34;</p></td>
 <td><p>ReasonMissingRulerSecret when the required secret to authorization remote write connections
 for the ruler is missing.</p>
@@ -2125,6 +2128,50 @@ are degraded or the cluster cannot connect to object storage.</p>
 issues. There can be multiple warning conditions active at a time.</p>
 </td>
 </tr></tbody>
+</table>
+
+## LokiStackNetworkPolicyStatus { #loki-grafana-com-v1-LokiStackNetworkPolicyStatus }
+<p>
+(<em>Appears on:</em><a href="#loki-grafana-com-v1-LokiStackStatus">LokiStackStatus</a>)
+</p>
+<div>
+<p>LokiStackNetworkPolicyStatus defines the observed network policy configuration</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>ruleSet</code><br/>
+<em>
+<a href="#loki-grafana-com-v1-NetworkPolicyRuleSet">
+NetworkPolicyRuleSet
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>RuleSet indicates which NetworkPolicies ruleset was applied by the operator for this LokiStack.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>objectStorageAllowedEgressPorts</code><br/>
+<em>
+[]int32
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>ObjectStorageAllowedEgressPorts contains the TCP ports allowed for egress to object storage endpoints.</p>
+</td>
+</tr>
+</tbody>
 </table>
 
 ## LokiStackSizeType { #loki-grafana-com-v1-LokiStackSizeType }
@@ -2439,16 +2486,16 @@ to the storage configuration.</p>
 </tr>
 <tr>
 <td>
-<code>networkPolicyRuleSet</code><br/>
+<code>networkPolicyStatus</code><br/>
 <em>
-<a href="#loki-grafana-com-v1-NetworkPolicyRuleSet">
-NetworkPolicyRuleSet
+<a href="#loki-grafana-com-v1-LokiStackNetworkPolicyStatus">
+LokiStackNetworkPolicyStatus
 </a>
 </em>
 </td>
 <td>
 <em>(Optional)</em>
-<p>NetworkPolicyRuleSet indicates which NetworkPolicies ruleset was applied by the operator for this LokiStack.</p>
+<p>NetworkPolicyStatus provides details about the applied NetworkPolicies configuration</p>
 </td>
 </tr>
 <tr>
@@ -2836,7 +2883,7 @@ NetworkPolicyRuleSet
 ## NetworkPolicyRuleSet { #loki-grafana-com-v1-NetworkPolicyRuleSet }
 (<code>string</code> alias)
 <p>
-(<em>Appears on:</em><a href="#loki-grafana-com-v1-LokiStackStatus">LokiStackStatus</a>, <a href="#loki-grafana-com-v1-NetworkPoliciesSpec">NetworkPoliciesSpec</a>)
+(<em>Appears on:</em><a href="#loki-grafana-com-v1-LokiStackNetworkPolicyStatus">LokiStackNetworkPolicyStatus</a>, <a href="#loki-grafana-com-v1-NetworkPoliciesSpec">NetworkPoliciesSpec</a>)
 </p>
 <div>
 <p>NetworkPolicyRuleSet is the type of network policy rule set to use</p>
@@ -3229,9 +3276,11 @@ used with the Loki cluster.</p>
 </thead>
 <tbody><tr><td><p>&#34;v11&#34;</p></td>
 <td><p>ObjectStorageSchemaV11 when using v11 for the storage schema</p>
+<p>Deprecated: ObjectStorageSchemaV11 is deprecated and will no longer reconcile. Use ObjectStorageSchemaV13 instead.</p>
 </td>
 </tr><tr><td><p>&#34;v12&#34;</p></td>
 <td><p>ObjectStorageSchemaV12 when using v12 for the storage schema</p>
+<p>Deprecated: ObjectStorageSchemaV12 is deprecated and will no longer reconcile. Use ObjectStorageSchemaV13 instead.</p>
 </td>
 </tr><tr><td><p>&#34;v13&#34;</p></td>
 <td><p>ObjectStorageSchemaV13 when using v13 for the storage schema</p>
@@ -3356,7 +3405,6 @@ storage bucket to persist logs by the ingester component.</p>
 </em>
 </td>
 <td>
-<em>(Optional)</em>
 <p>Schemas for reading and writing logs.</p>
 </td>
 </tr>

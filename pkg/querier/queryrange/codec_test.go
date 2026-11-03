@@ -35,6 +35,8 @@ import (
 	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 	"github.com/grafana/loki/v3/pkg/querier/plan"
 	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/querier/testutil"
+	"github.com/grafana/loki/v3/pkg/storage/detected"
 	"github.com/grafana/loki/v3/pkg/util"
 	"github.com/grafana/loki/v3/pkg/util/httpreq"
 )
@@ -69,9 +71,7 @@ func Test_codec_EncodeDecodeRequest(t *testing.T) {
 			Path:      "/query_range",
 			StartTs:   start,
 			EndTs:     end,
-			Plan: &plan.QueryPlan{
-				AST: syntax.MustParseExpr(`{foo="bar"}`),
-			},
+			Plan:      testutil.MustPlan(`{foo="bar"}`),
 		}, false},
 		{"query_range", func() (*http.Request, error) {
 			return http.NewRequest(http.MethodGet,
@@ -85,9 +85,7 @@ func Test_codec_EncodeDecodeRequest(t *testing.T) {
 			Path:      "/query_range",
 			StartTs:   start,
 			EndTs:     end,
-			Plan: &plan.QueryPlan{
-				AST: syntax.MustParseExpr(`{foo="bar"}`),
-			},
+			Plan:      testutil.MustPlan(`{foo="bar"}`),
 		}, false},
 		{"legacy query_range with refexp", func() (*http.Request, error) {
 			return http.NewRequest(http.MethodGet,
@@ -101,9 +99,7 @@ func Test_codec_EncodeDecodeRequest(t *testing.T) {
 			Path:      "/api/prom/query",
 			StartTs:   start,
 			EndTs:     end,
-			Plan: &plan.QueryPlan{
-				AST: syntax.MustParseExpr(`{foo="bar"} |~ "foo"`),
-			},
+			Plan:      testutil.MustPlan(`{foo="bar"} |~ "foo"`),
 		}, false},
 		{"series", func() (*http.Request, error) {
 			return http.NewRequest(http.MethodGet,
@@ -333,9 +329,7 @@ func Test_codec_DecodeRequest_cacheHeader(t *testing.T) {
 				Direction: logproto.FORWARD,
 				Path:      "/v1/query",
 				TimeTs:    start,
-				Plan: &plan.QueryPlan{
-					AST: syntax.MustParseExpr(`{foo="bar"}`),
-				},
+				Plan:      testutil.MustPlan(`{foo="bar"}`),
 				CachingOptions: queryrangebase.CachingOptions{
 					Disabled: true,
 				},
@@ -362,9 +356,7 @@ func Test_codec_DecodeRequest_cacheHeader(t *testing.T) {
 				Path:      "/query_range",
 				StartTs:   start,
 				EndTs:     end,
-				Plan: &plan.QueryPlan{
-					AST: syntax.MustParseExpr(`{foo="bar"}`),
-				},
+				Plan:      testutil.MustPlan(`{foo="bar"}`),
 				CachingOptions: queryrangebase.CachingOptions{
 					Disabled: true,
 				},
@@ -611,12 +603,13 @@ func Test_codec_DecodeResponse(t *testing.T) {
 		{
 			"series error key decode", &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"status":"success","data": [{"\x": "some string"}]}`))},
 			&LokiSeriesRequest{Path: "/loki/api/v1/series"},
-			nil, "invalid character 'x' in string escape code",
+			// encoding/json error text changed in Go 1.27 when the package switched to the v2 backend.
+			nil, "error decoding response: invalid",
 		},
 		{
 			"series error value decode", &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"status":"success","data": [{"label": "some string\x"}]}`))},
 			&LokiSeriesRequest{Path: "/loki/api/v1/series"},
-			nil, "invalid character 'x' in string escape code",
+			nil, "error decoding response: invalid",
 		},
 	}
 	for _, tt := range tests {
@@ -988,6 +981,10 @@ func Test_codec_EncodeRequest(t *testing.T) {
 		Path:      "/query_range",
 		StartTs:   start,
 		EndTs:     end,
+		HintRanges: []logproto.HintTimeRange{
+			{Start: start.Add(5 * time.Minute), End: start.Add(10 * time.Minute)},
+			{Start: start.Add(20 * time.Minute), End: start.Add(30 * time.Minute)},
+		},
 	}
 	got, err = DefaultCodec.EncodeRequest(ctx, toEncode)
 	require.NoError(t, err)
@@ -1000,18 +997,45 @@ func Test_codec_EncodeRequest(t *testing.T) {
 	require.Equal(t, `FORWARD`, got.URL.Query().Get("direction"))
 	require.Equal(t, "86400.000000", got.URL.Query().Get("step"))
 	require.Equal(t, "10000.000000", got.URL.Query().Get("interval"))
+	require.Len(t, got.URL.Query()["hintRanges"], 1)
 
 	// testing a full roundtrip
 	req, err := DefaultCodec.DecodeRequest(context.TODO(), got, nil)
 	require.NoError(t, err)
-	require.Equal(t, toEncode.Query, req.(*LokiRequest).Query)
-	require.Equal(t, toEncode.Step, req.(*LokiRequest).Step)
-	require.Equal(t, toEncode.Interval, req.(*LokiRequest).Interval)
-	require.Equal(t, toEncode.StartTs, req.(*LokiRequest).StartTs)
-	require.Equal(t, toEncode.EndTs, req.(*LokiRequest).EndTs)
-	require.Equal(t, toEncode.Direction, req.(*LokiRequest).Direction)
-	require.Equal(t, toEncode.Limit, req.(*LokiRequest).Limit)
-	require.Equal(t, "/loki/api/v1/query_range", req.(*LokiRequest).Path)
+	decoded := req.(*LokiRequest)
+	require.Equal(t, toEncode.Query, decoded.Query)
+	require.Equal(t, toEncode.Step, decoded.Step)
+	require.Equal(t, toEncode.Interval, decoded.Interval)
+	require.Equal(t, toEncode.StartTs, decoded.StartTs)
+	require.Equal(t, toEncode.EndTs, decoded.EndTs)
+	require.Equal(t, toEncode.Direction, decoded.Direction)
+	require.Equal(t, toEncode.Limit, decoded.Limit)
+	require.Equal(t, toEncode.HintRanges, decoded.HintRanges)
+	require.Equal(t, "/loki/api/v1/query_range", decoded.Path)
+}
+
+func TestLokiRequestWithStartEndClipsHintRangesWithoutMutation(t *testing.T) {
+	original := &LokiRequest{
+		StartTs: start,
+		EndTs:   end,
+		HintRanges: []logproto.HintTimeRange{
+			{Start: start.Add(-time.Minute), End: start.Add(10 * time.Minute)},
+			{Start: start.Add(20 * time.Minute), End: start.Add(40 * time.Minute)},
+			{Start: end, End: end.Add(time.Minute)},
+		},
+	}
+
+	got := original.WithStartEnd(start.Add(5*time.Minute), start.Add(30*time.Minute)).(*LokiRequest)
+
+	require.Equal(t, []logproto.HintTimeRange{
+		{Start: start.Add(5 * time.Minute), End: start.Add(10 * time.Minute)},
+		{Start: start.Add(20 * time.Minute), End: start.Add(30 * time.Minute)},
+	}, got.HintRanges)
+	require.Equal(t, []logproto.HintTimeRange{
+		{Start: start.Add(-time.Minute), End: start.Add(10 * time.Minute)},
+		{Start: start.Add(20 * time.Minute), End: start.Add(40 * time.Minute)},
+		{Start: end, End: end.Add(time.Minute)},
+	}, original.HintRanges)
 }
 
 func Test_codec_series_EncodeRequest(t *testing.T) {
@@ -1142,6 +1166,16 @@ func Test_codec_index_stats_EncodeRequest(t *testing.T) {
 	require.Equal(t, fmt.Sprintf("%d", from.UnixNano()), got.URL.Query().Get("start"))
 	require.Equal(t, fmt.Sprintf("%d", through.UnixNano()), got.URL.Query().Get("end"))
 	require.Equal(t, `{job="foo"}`, got.URL.Query().Get("query"))
+}
+
+func Test_codec_hints_EncodeRequest(t *testing.T) {
+	ctx := user.InjectOrgID(context.Background(), "1")
+	got, err := DefaultCodec.EncodeRequest(ctx, &logproto.LoglineIndexRequest{
+		Expr: `{job="foo"}`,
+	})
+	require.Error(t, err)
+	require.Nil(t, got)
+	require.ErrorContains(t, err, "LoglineIndexRequest requires frontend.encoding=protobuf")
 }
 
 func Test_codec_seriesVolume_EncodeRequest(t *testing.T) {
@@ -1963,6 +1997,46 @@ func Test_codec_MergeResponse_DetectedFieldsResponse(t *testing.T) {
 	})
 }
 
+// Test_codec_MergeResponse_DetectedLabelsResponse is a regression test for
+// https://github.com/grafana/loki/issues/16315: a multi-tenant detected_labels query 500s with
+// "too short binary".
+func Test_codec_MergeResponse_DetectedLabelsResponse(t *testing.T) {
+	// Build a response as MultiTenantQuerier.DetectedLabels would: per-tenant
+	// labels merged through detected.MergeLabels.
+	buildTenantMergedResponse := func(label string, cardinality int) *DetectedLabelsResponse {
+		var perTenant []*logproto.DetectedLabel
+		for tenant := 0; tenant < 2; tenant++ {
+			sketch := hyperloglog.New()
+			for i := 0; i < cardinality; i++ {
+				sketch.Insert([]byte(fmt.Sprintf("tenant-%d-value-%d", tenant, i)))
+			}
+			marshalled, err := sketch.MarshalBinary()
+			require.NoError(t, err)
+			perTenant = append(perTenant, &logproto.DetectedLabel{Label: label, Sketch: marshalled})
+		}
+
+		merged, err := detected.MergeLabels(perTenant)
+		require.NoError(t, err)
+
+		return &DetectedLabelsResponse{
+			Response: &logproto.DetectedLabelsResponse{DetectedLabels: merged},
+		}
+	}
+
+	// Two split-interval responses, each already merged across tenants.
+	responses := []queryrangebase.Response{
+		buildTenantMergedResponse("foo", 5),
+		buildTenantMergedResponse("foo", 7),
+	}
+
+	got, err := DefaultCodec.MergeResponse(responses...)
+	require.NoError(t, err)
+
+	response := got.(*DetectedLabelsResponse).Response
+	require.Len(t, response.DetectedLabels, 1)
+	require.Equal(t, "foo", response.DetectedLabels[0].Label)
+}
+
 type badResponse struct{}
 
 func (badResponse) Reset()                                                 {}
@@ -2009,6 +2083,7 @@ var (
 					"prePredicateDecompressedRows": 0,
 					"prePredicateDecompressedBytes": 0,
 					"prePredicateDecompressedStructuredMetadataBytes": 0,
+					"sectionsResolutionMaxTime": 0,
 					"totalPageDownloadTime": 0,
 					"totalRowsAvailable": 0,
 					"wireBytesTransferred": 0
@@ -2018,7 +2093,8 @@ var (
 				"chunkRefsFetchTime": 0,
 				"queryReferencedStructuredMetadata": false,
 				"queryUsedV2Engine": false,
-				"pipelineWrapperFilteredLines": 2
+				"pipelineWrapperFilteredLines": 2,
+				"chunkFetchFailures": 0
 			},
 			"totalBatches": 6,
 			"totalChunksMatched": 7,
@@ -2053,6 +2129,7 @@ var (
 					"prePredicateDecompressedRows": 0,
 					"prePredicateDecompressedBytes": 0,
 					"prePredicateDecompressedStructuredMetadataBytes": 0,
+					"sectionsResolutionMaxTime": 0,
 					"totalPageDownloadTime": 0,
 					"totalRowsAvailable": 0,
 					"wireBytesTransferred": 0
@@ -2062,7 +2139,8 @@ var (
 				"chunkRefsFetchTime": 19,
 				"queryReferencedStructuredMetadata": true,
 				"queryUsedV2Engine": false,
-				"pipelineWrapperFilteredLines": 4
+				"pipelineWrapperFilteredLines": 4,
+				"chunkFetchFailures": 0
 			}
 		},
 		"index": {
@@ -2183,7 +2261,9 @@ var (
 			"queueTime": 21,
 			"shards": 0,
 			"splits": 0,
+			"streamFirstQueries": 0,
 			"subqueries": 0,
+			"timestampFirstQueries": 0,
 			"totalBytesProcessed": 24,
 			"totalEntriesReturned": 10,
 			"totalLinesProcessed": 25,
@@ -2682,6 +2762,47 @@ func Test_codec_DetectedLabelsResponseProtobufRoundTrip(t *testing.T) {
 	gotDetected, ok := got.(*DetectedLabelsResponse)
 	require.True(t, ok, "expected *DetectedLabelsResponse, got %T", got)
 	require.Equal(t, want.Response, gotDetected.Response)
+}
+
+func Test_codec_CountDistinctSketchResponseProtobufRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	hll := hyperloglog.New14()
+	hll.Insert([]byte("shared"))
+	hllBytes, err := hll.MarshalBinary()
+	require.NoError(t, err)
+
+	want := &CountDistinctSketchResponse{
+		Response: &logproto.CountDistinctSketchMatrix{
+			Values: []*logproto.CountDistinctSketchVector{
+				{
+					Samples: []*logproto.CountDistinctSketchSample{
+						{
+							Hyperloglog: hllBytes,
+							TimestampMs: 1000,
+							Metric:      []*logproto.LabelPair{{Name: "version", Value: "1"}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	u := &url.URL{Path: "/loki/api/v1/query"}
+	encReq := &http.Request{
+		Method:     "GET",
+		RequestURI: u.String(),
+		URL:        u,
+		Header:     http.Header{"Accept": []string{ProtobufType}},
+	}
+	httpResp, err := DefaultCodec.EncodeResponse(ctx, encReq, want)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, httpResp.StatusCode)
+
+	got, err := DefaultCodec.DecodeResponse(ctx, httpResp, &LokiInstantRequest{Path: "/loki/api/v1/query"})
+	require.NoError(t, err)
+	gotCD, ok := got.(*CountDistinctSketchResponse)
+	require.True(t, ok, "expected *CountDistinctSketchResponse, got %T", got)
+	require.Equal(t, want.Response, gotCD.Response)
 }
 
 func Benchmark_CodecDecodeLogs(b *testing.B) {

@@ -10,14 +10,14 @@
   releasePRWorkflow: function(
     branches=['release-[0-9]+.[0-9]+.x', 'k[0-9]+'],
     buildArtifactsBucket='loki-build-artifacts',
-    buildImage='golang:1.24',
+    buildImage,
     changelogPath='CHANGELOG.md',
     checkTemplate='./.github/workflows/check.yml',
     distMakeTargets=['dist', 'packages'],
     distOptionalTargets=[],
     distRunsOn='ubuntu-x64',
     dryRun=false,
-    golangCiLintVersion='v2.3.0',
+    golangCiLintVersion='v2.13.2',
     imageBuildTimeoutMin=25,
     imageJobs={},
     imagePrefix='grafana',
@@ -91,6 +91,7 @@
     branches=['release-[0-9].[0-9].x', 'k[0-9]*'],
     buildArtifactsBucket='loki-build-artifacts',
     imagePrefix='grafana',
+    pluginImagePrefix=null,
     pluginBuildDir='release/plugin-tmp-dir',
     publishBucket='',
     publishToGCS=false,
@@ -99,9 +100,11 @@
     releaseBranchTemplate='release-\\${major}.\\${minor}.x',
     dockerPluginPath='clients/cmd/docker-driver',
     publishDockerPlugins=true,
+    createReleaseBranch=true,
                   ) {
     local githubApp = if releaseRepo == 'grafana/enterprise-logs' then 'enterprise-logs-app' else 'loki-gh-app',
     local garRepoSlug = if releaseRepo == 'grafana/enterprise-logs' then 'enterprise-logs' else 'loki',
+    local effectivePluginImagePrefix = if pluginImagePrefix != null then pluginImagePrefix else imagePrefix,
 
     name: 'create release',
     on: {
@@ -119,6 +122,7 @@
     env: {
       BUILD_ARTIFACTS_BUCKET: buildArtifactsBucket,
       IMAGE_PREFIX: imagePrefix,
+      PLUGIN_IMAGE_PREFIX: effectivePluginImagePrefix,
       RELEASE_LIB_REF: releaseLibRef,
       RELEASE_REPO: releaseRepo,
       GAR_REPO_SLUG: garRepoSlug,
@@ -150,9 +154,9 @@
            publishRelease: $.release.publishRelease(['createRelease', 'publishImages', 'publishDockerPlugins']),
          } else {
            publishRelease: $.release.publishRelease(['createRelease', 'publishImages']),
-         }) + {
-      createReleaseBranch: $.release.createReleaseBranch(releaseBranchTemplate),
-    },
+         }) + (if createReleaseBranch then {
+                 createReleaseBranch: $.release.createReleaseBranch(releaseBranchTemplate),
+               } else {}),
   },
   check: {
     name: 'check',
@@ -171,7 +175,7 @@
             type: 'boolean',
           },
           golang_ci_lint_version: {
-            default: 'v2.3.0',
+            default: 'v2.13.2',
             description: 'version of golangci-lint to use',
             required: false,
             type: 'string',
@@ -220,7 +224,7 @@
             type: 'boolean',
           },
           golang_ci_lint_version: {
-            default: 'v2.3.0',
+            default: 'v2.13.2',
             description: 'version of golangci-lint to use',
             required: false,
             type: 'string',

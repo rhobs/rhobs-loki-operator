@@ -237,7 +237,7 @@ func (is *indexSet) applyUpdates(labels labels.Labels, rebuiltChunks map[string]
 			From:        newChunk.GetFrom(),
 			Through:     newChunk.GetThrough(),
 			Checksum:    newChunk.GetChecksum(),
-		}, labels, newChunk.GetSize(), newChunk.GetEntriesCount())
+		}, labels, newChunk.GetIngestedAt(), newChunk.GetSize(), newChunk.GetEntriesCount())
 		if err != nil {
 			return nil, err
 		}
@@ -317,6 +317,11 @@ func (is *indexSet) upload() error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := idxReader.Close(); err != nil {
+			level.Error(util_log.Logger).Log("msg", "failed to close index reader", "path", idxPath, "err", err)
+		}
+	}()
 
 	_, err = idxReader.Seek(0, 0)
 	if err != nil {

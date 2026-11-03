@@ -2,9 +2,8 @@
 
 Currently there are six ways to try out Loki, in order from easier to hardest:
 
-- [Grafana Cloud: Hosted Logs](#grafana-cloud-logs)
+- [Grafana Cloud: Hosted Logs](#grafana-cloud-hosted-logs)
 - [Run Loki locally with Docker](#run-locally-using-docker)
-- [Run Loki with Nomad](#run-with-nomad)
 - [Use Helm to deploy on Kubernetes](#using-helm-to-deploy-on-kubernetes)
 - [Build Loki from source](#build-and-run-from-source)
 - [Get inspired by our production setup](#get-inspired-by-our-production-setup)
@@ -19,9 +18,9 @@ Grafana is offering hosted Loki as part of our broader Grafana Cloud platform. L
 
 The Docker images for [Loki](https://hub.docker.com/r/grafana/loki/) are available on DockerHub.
 
-To test locally, we recommend using the `docker-compose.yaml` file in this directory. Docker starts containers for Loki and Grafana.
+To test locally, we recommend using the `docker-compose.yaml` file in the `docker` directory. Docker starts containers for Loki and Grafana.
 
-1. Either `git clone` this repository locally and `cd loki/production`, or download a copy of the [docker-compose.yaml](docker-compose.yaml) locally.
+1. Either `git clone` this repository locally and `cd loki/production/docker`, or download a copy of the [docker-compose.yaml](docker/docker-compose.yaml) locally.
 
 1. Ensure you have the most up-to-date Docker container images:
 
@@ -41,12 +40,6 @@ To test locally, we recommend using the `docker-compose.yaml` file in this direc
 For instructions on how to query Loki, see [our usage docs](https://grafana.com/docs/loki/latest/logql/).
 
 To deploy a cluster of loki locally, please refer to this [doc](./docker/)
-
-## Run with Nomad
-
-There are example [Nomad jobs](./nomad) that can be used to deploy Loki with
-[Nomad](https://www.nomadproject.io/) - simple and powerful workload
-orchestrator from HashiCorp.
 
 ## Using Helm to deploy on Kubernetes
 

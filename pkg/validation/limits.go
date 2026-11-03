@@ -14,9 +14,8 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/sigv4"
+	"go.uber.org/atomic"
 	yaml "go.yaml.in/yaml/v4"
 	"golang.org/x/time/rate"
 
@@ -26,8 +25,7 @@ import (
 	"github.com/grafana/loki/v3/pkg/loghttp/push"
 	"github.com/grafana/loki/v3/pkg/logql"
 	"github.com/grafana/loki/v3/pkg/logql/syntax"
-	ruler_config "github.com/grafana/loki/v3/pkg/ruler/config"
-	"github.com/grafana/loki/v3/pkg/ruler/util"
+	rulerconfig "github.com/grafana/loki/v3/pkg/ruler/config"
 	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper/tsdb/sharding"
 	"github.com/grafana/loki/v3/pkg/util/flagext"
 	util_log "github.com/grafana/loki/v3/pkg/util/log"
@@ -65,6 +63,11 @@ const (
 	defaultBloomTaskTargetChunkSize   = "20GB"
 
 	defaultBlockedIngestionStatusCode = 260 // 260 is a custom status code to indicate blocked ingestion
+
+	// defaultLoglineQueryMinQueryBytesForIndex is the minimum query size, in
+	// index-stats bytes, for logline filtering to kick in. Anyone with serious
+	// amounts of data might want to raise it.
+	defaultLoglineQueryMinQueryBytesForIndex = 10 * 1024 * 1024 * 1024 // 10GiB
 )
 
 var (
@@ -84,6 +87,8 @@ var (
 		"Severity_Text",
 		"SEVERITY_TEXT",
 	}
+
+	errLogCompactionRequiresIndex = errors.New("dataobj_log_compaction_enabled requires dataobj_index_compaction_enabled")
 )
 
 // Limits describe all the limits for users; can be used to describe global default
@@ -104,11 +109,9 @@ type Limits struct {
 	MaxLineSize                   flagext.ByteSize `yaml:"max_line_size" json:"max_line_size"`
 	MaxLineSizeTruncate           bool             `yaml:"max_line_size_truncate" json:"max_line_size_truncate"`
 	MaxLineSizeTruncateIdentifier string           `yaml:"max_line_size_truncate_identifier" json:"max_line_size_truncate_identifier"`
+	MaxPushSize                   flagext.ByteSize `yaml:"max_push_size" json:"max_push_size"`
 	IncrementDuplicateTimestamp   bool             `yaml:"increment_duplicate_timestamp" json:"increment_duplicate_timestamp"`
 	SimulatedPushLatency          time.Duration    `yaml:"simulated_push_latency" json:"simulated_push_latency" doc:"description=Simulated latency to add to push requests. Used for testing. Set to 0s to disable."`
-
-	// LogQL engine options
-	EnableMultiVariantQueries bool `yaml:"enable_multi_variant_queries" json:"enable_multi_variant_queries"`
 
 	// Metadata field extraction
 	DiscoverGenericFields    FieldDetectorConfig `yaml:"discover_generic_fields" json:"discover_generic_fields" doc:"description=Experimental: Detect fields from stream labels, structured metadata, or json/logfmt formatted log line and put them into structured metadata of the log entry."`
@@ -119,33 +122,36 @@ type Limits struct {
 
 	// Ingester enforced limits.
 	UseOwnedStreamCount     bool             `yaml:"use_owned_stream_count" json:"use_owned_stream_count"`
+	DelegateStreamLimits    bool             `yaml:"delegate_stream_limits_enabled" json:"delegate_stream_limits_enabled"`
 	MaxLocalStreamsPerUser  int              `yaml:"max_streams_per_user" json:"max_streams_per_user"`
 	MaxGlobalStreamsPerUser int              `yaml:"max_global_streams_per_user" json:"max_global_streams_per_user"`
 	PerStreamRateLimit      flagext.ByteSize `yaml:"per_stream_rate_limit" json:"per_stream_rate_limit"`
 	PerStreamRateLimitBurst flagext.ByteSize `yaml:"per_stream_rate_limit_burst" json:"per_stream_rate_limit_burst"`
 
 	// Querier enforced limits.
-	MaxChunksPerQuery          int              `yaml:"max_chunks_per_query" json:"max_chunks_per_query"`
-	MaxQuerySeries             int              `yaml:"max_query_series" json:"max_query_series"`
-	MaxQueryLookback           model.Duration   `yaml:"max_query_lookback" json:"max_query_lookback"`
-	MaxQueryLength             model.Duration   `yaml:"max_query_length" json:"max_query_length"`
-	MaxQueryRange              model.Duration   `yaml:"max_query_range" json:"max_query_range"`
-	MaxQueryParallelism        int              `yaml:"max_query_parallelism" json:"max_query_parallelism"`
-	TSDBMaxQueryParallelism    int              `yaml:"tsdb_max_query_parallelism" json:"tsdb_max_query_parallelism"`
-	TSDBMaxBytesPerShard       flagext.ByteSize `yaml:"tsdb_max_bytes_per_shard" json:"tsdb_max_bytes_per_shard"`
-	TSDBShardingStrategy       string           `yaml:"tsdb_sharding_strategy" json:"tsdb_sharding_strategy"`
-	TSDBPrecomputeChunks       bool             `yaml:"tsdb_precompute_chunks" json:"tsdb_precompute_chunks"`
-	CardinalityLimit           int              `yaml:"cardinality_limit" json:"cardinality_limit"`
-	MaxStreamsMatchersPerQuery int              `yaml:"max_streams_matchers_per_query" json:"max_streams_matchers_per_query"`
-	MaxConcurrentTailRequests  int              `yaml:"max_concurrent_tail_requests" json:"max_concurrent_tail_requests"`
-	MaxEntriesLimitPerQuery    int              `yaml:"max_entries_limit_per_query" json:"max_entries_limit_per_query"`
-	MaxCacheFreshness          model.Duration   `yaml:"max_cache_freshness_per_query" json:"max_cache_freshness_per_query"`
-	MaxMetadataCacheFreshness  model.Duration   `yaml:"max_metadata_cache_freshness" json:"max_metadata_cache_freshness"`
-	MaxStatsCacheFreshness     model.Duration   `yaml:"max_stats_cache_freshness" json:"max_stats_cache_freshness"`
-	MaxQueriersPerTenant       uint             `yaml:"max_queriers_per_tenant" json:"max_queriers_per_tenant"`
-	MaxQueryCapacity           float64          `yaml:"max_query_capacity" json:"max_query_capacity"`
-	QueryReadyIndexNumDays     int              `yaml:"query_ready_index_num_days" json:"query_ready_index_num_days"`
-	QueryTimeout               model.Duration   `yaml:"query_timeout" json:"query_timeout"`
+	MaxChunksPerQuery           int                `yaml:"max_chunks_per_query" json:"max_chunks_per_query"`
+	MaxQuerySeries              int                `yaml:"max_query_series" json:"max_query_series"`
+	MaxQueryLookback            model.Duration     `yaml:"max_query_lookback" json:"max_query_lookback"`
+	MaxQueryLength              model.Duration     `yaml:"max_query_length" json:"max_query_length"`
+	MaxQueryRange               model.Duration     `yaml:"max_query_range" json:"max_query_range"`
+	MaxQueryParallelism         int                `yaml:"max_query_parallelism" json:"max_query_parallelism"`
+	TSDBMaxQueryParallelism     int                `yaml:"tsdb_max_query_parallelism" json:"tsdb_max_query_parallelism"`
+	TSDBMaxBytesPerShard        flagext.ByteSize   `yaml:"tsdb_max_bytes_per_shard" json:"tsdb_max_bytes_per_shard"`
+	TSDBShardingStrategy        string             `yaml:"tsdb_sharding_strategy" json:"tsdb_sharding_strategy"`
+	TSDBPrecomputeChunks        bool               `yaml:"tsdb_precompute_chunks" json:"tsdb_precompute_chunks"`
+	CardinalityLimit            int                `yaml:"cardinality_limit" json:"cardinality_limit"`
+	MaxStreamsMatchersPerQuery  int                `yaml:"max_streams_matchers_per_query" json:"max_streams_matchers_per_query"`
+	MaxConcurrentTailRequests   int                `yaml:"max_concurrent_tail_requests" json:"max_concurrent_tail_requests"`
+	MaxEntriesLimitPerQuery     int                `yaml:"max_entries_limit_per_query" json:"max_entries_limit_per_query"`
+	MaxCacheFreshness           model.Duration     `yaml:"max_cache_freshness_per_query" json:"max_cache_freshness_per_query"`
+	MaxMetadataCacheFreshness   model.Duration     `yaml:"max_metadata_cache_freshness" json:"max_metadata_cache_freshness"`
+	MaxStatsCacheFreshness      model.Duration     `yaml:"max_stats_cache_freshness" json:"max_stats_cache_freshness"`
+	MaxQueriersPerTenant        uint               `yaml:"max_queriers_per_tenant" json:"max_queriers_per_tenant"`
+	MaxQueryCapacity            float64            `yaml:"max_query_capacity" json:"max_query_capacity"`
+	QueryReadyIndexNumDays      int                `yaml:"query_ready_index_num_days" json:"query_ready_index_num_days"`
+	QueryTimeout                model.Duration     `yaml:"query_timeout" json:"query_timeout"`
+	StreamFirstExecutionEnabled bool               `yaml:"stream_first_execution_enabled" json:"stream_first_execution_enabled" category:"experimental"`
+	DataObjQueryStartTime       dskit_flagext.Time `yaml:"dataobj_query_start_time" json:"dataobj_query_start_time" category:"experimental"`
 
 	// Query frontend enforced limits. The default is actually parameterized by the queryrange config.
 	QuerySplitDuration                   model.Duration   `yaml:"split_queries_by_interval" json:"split_queries_by_interval"`
@@ -162,11 +168,10 @@ type Limits struct {
 	VolumeMaxSeries                      int              `yaml:"volume_max_series" json:"volume_max_series" doc:"description=The maximum number of aggregated series in a log-volume response"`
 
 	// Ruler defaults and limits.
-	RulerMaxRulesPerRuleGroup   int                              `yaml:"ruler_max_rules_per_rule_group" json:"ruler_max_rules_per_rule_group"`
-	RulerMaxRuleGroupsPerTenant int                              `yaml:"ruler_max_rule_groups_per_tenant" json:"ruler_max_rule_groups_per_tenant"`
-	RulerAlertManagerConfig     *ruler_config.AlertManagerConfig `yaml:"ruler_alertmanager_config" json:"ruler_alertmanager_config" doc:"hidden"`
-	RulerTenantShardSize        int                              `yaml:"ruler_tenant_shard_size" json:"ruler_tenant_shard_size"`
-	RulerEnableWALReplay        bool                             `yaml:"ruler_enable_wal_replay" json:"ruler_enable_wal_replay" doc:"description=Enable WAL replay on ruler startup. Disabling this can reduce memory usage on startup at the cost of not recovering in-memory WAL metrics on restart."`
+	RulerMaxRulesPerRuleGroup   int                             `yaml:"ruler_max_rules_per_rule_group" json:"ruler_max_rules_per_rule_group"`
+	RulerMaxRuleGroupsPerTenant int                             `yaml:"ruler_max_rule_groups_per_tenant" json:"ruler_max_rule_groups_per_tenant"`
+	RulerAlertManagerConfig     *rulerconfig.AlertManagerConfig `yaml:"ruler_alertmanager_config" json:"ruler_alertmanager_config" doc:"hidden"`
+	RulerTenantShardSize        int                             `yaml:"ruler_tenant_shard_size" json:"ruler_tenant_shard_size"`
 
 	// TODO(dannyk): add HTTP client overrides (basic auth / tls config, etc)
 	// Ruler remote-write limits.
@@ -175,34 +180,7 @@ type Limits struct {
 	// and if it were ruler_remote_write_enabled, it would be impossible to know if the value was explicitly set or default
 	RulerRemoteWriteDisabled bool `yaml:"ruler_remote_write_disabled" json:"ruler_remote_write_disabled" doc:"description=Disable recording rules remote-write."`
 
-	// deprecated use RulerRemoteWriteConfig instead.
-	RulerRemoteWriteURL string `yaml:"ruler_remote_write_url" json:"ruler_remote_write_url" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. The URL of the endpoint to send samples to."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteTimeout time.Duration `yaml:"ruler_remote_write_timeout" json:"ruler_remote_write_timeout" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Timeout for requests to the remote write endpoint."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteHeaders OverwriteMarshalingStringMap `yaml:"ruler_remote_write_headers" json:"ruler_remote_write_headers" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Custom HTTP headers to be sent along with each remote write request. Be aware that headers that are set by Loki itself can't be overwritten."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteRelabelConfigs []*util.RelabelConfig `yaml:"ruler_remote_write_relabel_configs,omitempty" json:"ruler_remote_write_relabel_configs,omitempty" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. List of remote write relabel configurations."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteQueueCapacity int `yaml:"ruler_remote_write_queue_capacity" json:"ruler_remote_write_queue_capacity" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Number of samples to buffer per shard before we block reading of more samples from the WAL. It is recommended to have enough capacity in each shard to buffer several requests to keep throughput up while processing occasional slow remote requests."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteQueueMinShards int `yaml:"ruler_remote_write_queue_min_shards" json:"ruler_remote_write_queue_min_shards" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Minimum number of shards, i.e. amount of concurrency."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteQueueMaxShards int `yaml:"ruler_remote_write_queue_max_shards" json:"ruler_remote_write_queue_max_shards" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Maximum number of shards, i.e. amount of concurrency."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteQueueMaxSamplesPerSend int `yaml:"ruler_remote_write_queue_max_samples_per_send" json:"ruler_remote_write_queue_max_samples_per_send" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Maximum number of samples per send."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteQueueBatchSendDeadline time.Duration `yaml:"ruler_remote_write_queue_batch_send_deadline" json:"ruler_remote_write_queue_batch_send_deadline" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Maximum time a sample will wait in buffer."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteQueueMinBackoff time.Duration `yaml:"ruler_remote_write_queue_min_backoff" json:"ruler_remote_write_queue_min_backoff" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Initial retry delay. Gets doubled for every retry."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteQueueMaxBackoff time.Duration `yaml:"ruler_remote_write_queue_max_backoff" json:"ruler_remote_write_queue_max_backoff" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Maximum retry delay."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteQueueRetryOnRateLimit bool `yaml:"ruler_remote_write_queue_retry_on_ratelimit" json:"ruler_remote_write_queue_retry_on_ratelimit" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Retry upon receiving a 429 status code from the remote-write storage. This is experimental and might change in the future."`
-	// deprecated use RulerRemoteWriteConfig instead
-	RulerRemoteWriteSigV4Config *sigv4.SigV4Config `yaml:"ruler_remote_write_sigv4_config" json:"ruler_remote_write_sigv4_config" doc:"deprecated|description=Use 'ruler_remote_write_config' instead. Configures AWS's Signature Verification 4 signing process to sign every remote write request."`
-
-	RulerRemoteWriteConfig map[string]config.RemoteWriteConfig `yaml:"ruler_remote_write_config,omitempty" json:"ruler_remote_write_config,omitempty" doc:"description=Configures global and per-tenant limits for remote write clients. A map with remote client id as key."`
+	RulerRemoteWriteConfig map[string]rulerconfig.RemoteWriteConfig `yaml:"ruler_remote_write_config,omitempty" json:"ruler_remote_write_config,omitempty" doc:"description=Configures global and per-tenant limits for remote write clients. A map with remote client id as key."`
 
 	// TODO(dannyk): possible enhancement is to align this with rule group interval
 	RulerRemoteEvaluationTimeout         time.Duration `yaml:"ruler_remote_evaluation_timeout" json:"ruler_remote_evaluation_timeout" doc:"description=Timeout for a remote rule evaluation. Defaults to the value of 'querier.query-timeout'."`
@@ -214,10 +192,6 @@ type Limits struct {
 	// Global and per tenant retention
 	RetentionPeriod model.Duration    `yaml:"retention_period" json:"retention_period"`
 	StreamRetention []StreamRetention `yaml:"retention_stream,omitempty" json:"retention_stream,omitempty" doc:"description=Per-stream retention to apply, if the retention is enabled on the compactor side.\nExample:\n retention_stream:\n - selector: '{namespace=\"dev\"}'\n priority: 1\n period: 24h\n- selector: '{container=\"nginx\"}'\n priority: 1\n period: 744h\nSelector is a Prometheus labels matchers that will apply the 'period' retention only if the stream is matching. In case multiple streams are matching, the highest priority will be picked. If no rule is matched the 'retention_period' is used."`
-
-	// Config for overrides, convenient if it goes here.
-	PerTenantOverrideConfig string         `yaml:"per_tenant_override_config" json:"per_tenant_override_config"`
-	PerTenantOverridePeriod model.Duration `yaml:"per_tenant_override_period" json:"per_tenant_override_period"`
 
 	ShardStreams shardstreams.Config `yaml:"shard_streams" json:"shard_streams" doc:"description=Define streams sharding behavior."`
 
@@ -236,6 +210,8 @@ type Limits struct {
 	BloomBuilderResponseTimeout time.Duration `yaml:"bloom_build_builder_response_timeout" json:"bloom_build_builder_response_timeout" category:"experimental"`
 
 	BloomCreationEnabled           bool             `yaml:"bloom_creation_enabled" json:"bloom_creation_enabled" category:"experimental"`
+	DataObjIndexCompactionEnabled  bool             `yaml:"dataobj_index_compaction_enabled" json:"dataobj_index_compaction_enabled" category:"experimental"`
+	DataObjLogCompactionEnabled    bool             `yaml:"dataobj_log_compaction_enabled" json:"dataobj_log_compaction_enabled" category:"experimental"`
 	BloomPlanningStrategy          string           `yaml:"bloom_planning_strategy" json:"bloom_planning_strategy" category:"experimental"`
 	BloomSplitSeriesKeyspaceBy     int              `yaml:"bloom_split_series_keyspace_by" json:"bloom_split_series_keyspace_by" category:"experimental"`
 	BloomTaskTargetSeriesChunkSize flagext.ByteSize `yaml:"bloom_task_target_series_chunk_size" json:"bloom_task_target_series_chunk_size" category:"experimental"`
@@ -269,6 +245,11 @@ type Limits struct {
 
 	ShardAggregations []string `yaml:"shard_aggregations,omitempty" json:"shard_aggregations,omitempty" doc:"description=List of LogQL vector and range aggregations that should be sharded."`
 
+	// Per-tenant logline filtering in the query path. Hidden from the config
+	// reference while logline is experimental.
+	LoglineQueryMode                  string `yaml:"logline_query_mode" json:"logline_query_mode" doc:"hidden" category:"experimental"`
+	LoglineQueryMinQueryBytesForIndex int64  `yaml:"logline_query_min_query_bytes_for_index" json:"logline_query_min_query_bytes_for_index" doc:"hidden" category:"experimental"`
+
 	PatternIngesterTokenizableJSONFieldsDefault dskit_flagext.StringSliceCSV `yaml:"pattern_ingester_tokenizable_json_fields_default" json:"pattern_ingester_tokenizable_json_fields_default" doc:"description=Default list of JSON fields to tokenize for pattern detection. It is recommend to append to or delete from the defaults rather than replacing them."`
 	PatternIngesterTokenizableJSONFieldsAppend  dskit_flagext.StringSliceCSV `yaml:"pattern_ingester_tokenizable_json_fields_append"  json:"pattern_ingester_tokenizable_json_fields_append"  doc:"description=List of additional JSON fields to tokenize for pattern detection."`
 	PatternIngesterTokenizableJSONFieldsDelete  dskit_flagext.StringSliceCSV `yaml:"pattern_ingester_tokenizable_json_fields_delete"  json:"pattern_ingester_tokenizable_json_fields_delete"  doc:"description=List of JSON fields to excluded from the defaults to tokenize for pattern detection."`
@@ -285,9 +266,8 @@ type Limits struct {
 
 	// Per tenant limits for the v2 execution engine
 
-	MaxScanTaskParallelism int  `yaml:"max_scan_task_parallelism" json:"max_scan_task_parallelism"`
-	DebugEngineTasks       bool `yaml:"debug_engine_tasks" json:"debug_engine_tasks"`
-	DebugEngineStreams     bool `yaml:"debug_engine_streams" json:"debug_engine_streams"`
+	DebugEngineTasks   bool `yaml:"debug_engine_tasks" json:"debug_engine_tasks"`
+	DebugEngineStreams bool `yaml:"debug_engine_streams" json:"debug_engine_streams"`
 
 	// Data-objects sort schema
 	SortSchema SortSchema `yaml:"sort_schema,omitempty" json:"sort_schema,omitempty" doc:"hidden"`
@@ -349,18 +329,34 @@ func (s SortSchema) Validate() error {
 	return nil
 }
 
+// String implements flag.Value.
+func (s SortSchema) String() string {
+	parts := make([]string, len(s))
+	for i, fqn := range s {
+		parts[i] = string(fqn)
+	}
+	return strings.Join(parts, ",")
+}
+
+// Set implements flag.Value. Each call overwrites any previous value.
+// Input is a comma-separated list of SortKeyFqn values.
+func (s *SortSchema) Set(v string) error {
+	*s = nil
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		*s = append(*s, SortKeyFqn(part))
+	}
+	return nil
+}
+
 type StreamRetention struct {
 	Period   model.Duration    `yaml:"period" json:"period" doc:"description:Retention period applied to the log lines matching the selector."`
 	Priority int               `yaml:"priority" json:"priority" doc:"description:The larger the value, the higher the priority."`
 	Selector string            `yaml:"selector" json:"selector" doc:"description:Stream selector expression."`
 	Matchers []*labels.Matcher `yaml:"-" json:"-"` // populated during validation.
-}
-
-// LimitError are errors that do not comply with the limits specified.
-type LimitError string
-
-func (e LimitError) Error() string {
-	return string(e)
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -373,6 +369,9 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&l.MaxLineSize, "distributor.max-line-size", "Maximum line size on ingestion path. Example: 256kb. Any log line exceeding this limit will be discarded unless `distributor.max-line-size-truncate` is set, in which case it is truncated rather than discarded completely. There is no limit when set to 0.")
 	f.BoolVar(&l.MaxLineSizeTruncate, "distributor.max-line-size-truncate", false, "Whether to truncate lines that exceed max_line_size.")
 	f.StringVar(&l.MaxLineSizeTruncateIdentifier, "distributor.max-line-size-truncate-identifier", "", "Identifier that is added at the end of a truncated log line.")
+
+	_ = l.MaxPushSize.Set("2GB")
+	f.Var(&l.MaxPushSize, "distributor.max-push-size", "The maximum size of a Push request.")
 	f.IntVar(&l.MaxLabelNameLength, "validation.max-length-label-name", 1024, "Maximum length accepted for label names.")
 	f.IntVar(&l.MaxLabelValueLength, "validation.max-length-label-value", 2048, "Maximum length accepted for label value. This setting also applies to the metric name.")
 	f.IntVar(&l.MaxLabelNamesPerSeries, "validation.max-label-names-per-series", 15, "Maximum number of label names per series.")
@@ -407,6 +406,7 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.MaxEntriesLimitPerQuery, "validation.max-entries-limit", 5000, "Maximum number of log entries that will be returned for a query.")
 
 	f.BoolVar(&l.UseOwnedStreamCount, "ingester.use-owned-stream-count", false, "When true an ingester takes into account only the streams that it owns according to the ring while applying the stream limit.")
+	f.BoolVar(&l.DelegateStreamLimits, "limits.delegate-stream-limits-enabled", false, "When enabled, the ingester skips stream count limit checks for the tenant, delegating them entirely to the ingest-limits service. Requires ingest-limits service to be enabled. When this limit is not set, the deprecated ingester-wide setting -ingester.delegate-stream-limits-enabled provides its default.")
 	f.IntVar(&l.MaxLocalStreamsPerUser, "ingester.max-streams-per-user", 0, "Maximum number of active streams per user, per ingester. 0 to disable.")
 	f.IntVar(&l.MaxGlobalStreamsPerUser, "ingester.max-global-streams-per-user", 5000, "Maximum number of active streams per user, across the cluster. 0 to disable. When the global limit is enabled, each ingester is configured with a dynamic local limit based on the replication factor and the current number of healthy ingesters, and is kept updated whenever the number of ingesters change.")
 
@@ -424,6 +424,8 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&l.MaxQueryRange, "querier.max-query-range", "Limit the length of the [range] inside a range query. Default is 0 or unlimited")
 	_ = l.QueryTimeout.Set(DefaultPerTenantQueryTimeout)
 	f.Var(&l.QueryTimeout, "querier.query-timeout", "Timeout when querying backends (ingesters or storage) during the execution of a query request. When a specific per-tenant timeout is used, the global timeout is ignored.")
+	f.BoolVar(&l.StreamFirstExecutionEnabled, "querier.stream-first-execution-enabled", false, "When enabled, the querier evaluates eligible metric queries in stream-first order, which reads samples one stream at a time instead of in timestamp order.")
+	f.Var(&l.DataObjQueryStartTime, "querier.dataobj-query-start-time", "Time, inclusive, from which the querier reads stream-first metric queries from data objects. 0 disables it.")
 
 	_ = l.MaxQueryLookback.Set("0s")
 	f.Var(&l.MaxQueryLookback, "querier.max-query-lookback", "Limit how far back in time series data and metadata can be queried, up until lookback duration ago. This limit is enforced in the query frontend, the querier and the ruler. If the requested time range is outside the allowed range, the request will not fail, but will be modified to only query data within the allowed time range. The default value of 0 does not set a limit.")
@@ -463,20 +465,15 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&l.MaxStatsCacheFreshness, "frontend.max-stats-cache-freshness", "Do not cache requests with an end time that falls within Now minus this duration. 0 disables this feature (default).")
 
 	f.UintVar(&l.MaxQueriersPerTenant, "frontend.max-queriers-per-tenant", 0, "Maximum number of queriers that can handle requests for a single tenant. If set to 0 or value higher than number of available queriers, *all* queriers will handle requests for the tenant. Each frontend (or query-scheduler, if used) will select the same set of queriers for the same tenant (given that all queriers are connected to all frontends / query-schedulers). This option only works with queriers connecting to the query-frontend / query-scheduler, not when using downstream URL.")
-	f.Float64Var(&l.MaxQueryCapacity, "frontend.max-query-capacity", 0, "How much of the available query capacity (\"querier\" components in distributed mode, \"read\" components in SSD mode) can be used by a single tenant. Allowed values are 0.0 to 1.0. For example, setting this to 0.5 would allow a tenant to use half of the available queriers for processing the query workload. If set to 0, query capacity is determined by frontend.max-queriers-per-tenant. When both frontend.max-queriers-per-tenant and frontend.max-query-capacity are configured, smaller value of the resulting querier replica count is considered: min(frontend.max-queriers-per-tenant, ceil(querier_replicas * frontend.max-query-capacity)). *All* queriers will handle requests for the tenant if neither limits are applied. This option only works with queriers connecting to the query-frontend / query-scheduler, not when using downstream URL. Use this feature in a multi-tenant setup where you need to limit query capacity for certain tenants.")
+	f.Float64Var(&l.MaxQueryCapacity, "frontend.max-query-capacity", 0, "How much of the available query capacity (\"querier\" components) can be used by a single tenant. Allowed values are 0.0 to 1.0. For example, setting this to 0.5 would allow a tenant to use half of the available queriers for processing the query workload. If set to 0, query capacity is determined by frontend.max-queriers-per-tenant. When both frontend.max-queriers-per-tenant and frontend.max-query-capacity are configured, smaller value of the resulting querier replica count is considered: min(frontend.max-queriers-per-tenant, ceil(querier_replicas * frontend.max-query-capacity)). *All* queriers will handle requests for the tenant if neither limits are applied. This option only works with queriers connecting to the query-frontend / query-scheduler, not when using downstream URL. Use this feature in a multi-tenant setup where you need to limit query capacity for certain tenants.")
 	f.IntVar(&l.QueryReadyIndexNumDays, "store.query-ready-index-num-days", 0, "Number of days of index to be kept always downloaded for queries. Applies only to per user index in boltdb-shipper index store. 0 to disable.")
 
 	f.IntVar(&l.RulerMaxRulesPerRuleGroup, "ruler.max-rules-per-rule-group", 0, "Maximum number of rules per rule group per-tenant. 0 to disable.")
 	f.IntVar(&l.RulerMaxRuleGroupsPerTenant, "ruler.max-rule-groups-per-tenant", 0, "Maximum number of rule groups per-tenant. 0 to disable.")
 	f.IntVar(&l.RulerTenantShardSize, "ruler.tenant-shard-size", 0, "The default tenant's shard size when shuffle-sharding is enabled in the ruler. When this setting is specified in the per-tenant overrides, a value of 0 disables shuffle sharding for the tenant.")
-	f.BoolVar(&l.RulerEnableWALReplay, "ruler.enable-wal-replay", true, "Enable WAL replay on ruler startup. Disabling this can reduce memory usage on startup at the cost of not recovering in-memory WAL metrics on restart.")
 
-	f.StringVar(&l.PerTenantOverrideConfig, "limits.per-user-override-config", "", "Feature renamed to 'runtime configuration', flag deprecated in favor of -runtime-config.file (runtime_config.file in YAML).")
 	_ = l.RetentionPeriod.Set("0s")
 	f.Var(&l.RetentionPeriod, "store.retention", "Retention period to apply to stored data, only applies if retention_enabled is true in the compactor config. As of version 2.8.0, a zero value of 0 or 0s disables retention. In previous releases, Loki did not properly honor a zero value to disable retention and a really large value should be used instead.")
-
-	_ = l.PerTenantOverridePeriod.Set("10s")
-	f.Var(&l.PerTenantOverridePeriod, "limits.per-user-override-period", "Feature renamed to 'runtime configuration'; flag deprecated in favor of -runtime-config.reload-period (runtime_config.period in YAML).")
 
 	_ = l.QuerySplitDuration.Set("1h")
 	f.Var(&l.QuerySplitDuration, "querier.split-queries-by-interval", "Split queries by a time interval and execute in parallel. The value 0 disables splitting by time. This also determines how cache keys are chosen when result caching is enabled.")
@@ -515,6 +512,8 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	)
 
 	f.BoolVar(&l.BloomCreationEnabled, "bloom-build.enable", false, "Experimental. Whether to create blooms for the tenant.")
+	f.BoolVar(&l.DataObjIndexCompactionEnabled, "dataobj-compaction.index.enable", false, "Experimental. Whether dataobj index compaction runs for the tenant.")
+	f.BoolVar(&l.DataObjLogCompactionEnabled, "dataobj-compaction.log.enable", false, "Experimental. Whether dataobj log compaction runs for the tenant. Log compaction implies index compaction; enabling log compaction without index compaction is a configuration error.")
 	f.StringVar(&l.BloomPlanningStrategy, "bloom-build.planning-strategy", "split_keyspace_by_factor", "Experimental. Bloom planning strategy to use in bloom creation. Can be one of: 'split_keyspace_by_factor', 'split_by_series_chunks_size'")
 	f.IntVar(&l.BloomSplitSeriesKeyspaceBy, "bloom-build.split-keyspace-by", 256, "Experimental. Only if `bloom-build.planning-strategy` is 'split'. Number of splits to create for the series keyspace when building blooms. The series keyspace is split into this many parts to parallelize bloom creation.")
 	_ = l.BloomTaskTargetSeriesChunkSize.Set(defaultBloomTaskTargetChunkSize)
@@ -547,6 +546,11 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 
 	f.IntVar(&l.IngestionPartitionsTenantShardSize, "limits.ingestion-partition-tenant-shard-size", 0, "The number of partitions a tenant's data should be sharded to when using kafka ingestion. Tenants are sharded across partitions using shuffle-sharding. 0 disables shuffle sharding and tenant is sharded across all partitions.")
 
+	f.StringVar(&l.LoglineQueryMode, "logline-query.mode", "",
+		"Logline filtering mode for the tenant: off, dry_run or live. Empty leaves it to the logline.query settings and the X-Logline-Index request header.")
+	f.Int64Var(&l.LoglineQueryMinQueryBytesForIndex, "logline-query.min-query-bytes-for-index", defaultLoglineQueryMinQueryBytesForIndex,
+		"Minimum index-stats bytes a query must cover before logline looks up hints for it. 0 disables the check. The default is low, so anyone with serious amounts of data might want to raise it.")
+
 	_ = l.PatternIngesterTokenizableJSONFieldsDefault.Set("log,message,msg,msg_,_msg,content")
 	f.Var(&l.PatternIngesterTokenizableJSONFieldsDefault, "limits.pattern-ingester-tokenizable-json-fields", "List of JSON fields that should be tokenized in the pattern ingester.")
 	f.Var(&l.PatternIngesterTokenizableJSONFieldsAppend, "limits.pattern-ingester-tokenizable-json-fields-append", "List of JSON fields that should be appended to the default list of tokenizable fields in the pattern ingester.")
@@ -574,16 +578,11 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 
 	f.DurationVar(&l.SimulatedPushLatency, "limits.simulated-push-latency", 0, "Simulated latency to add to push requests. This is used to test the performance of the write path under different latency conditions.")
 
-	f.BoolVar(
-		&l.EnableMultiVariantQueries,
-		"limits.enable-multi-variant-queries",
-		false,
-		"Enable experimental support for running multiple query variants over the same underlying data. For example, running both a rate() and count_over_time() query over the same range selector.",
-	)
-
-	f.IntVar(&l.MaxScanTaskParallelism, "limits.max-scan-task-parallelism", 0, "Experimental: Controls the amount of scan tasks that can be running in parallel in the new query engine. The default of 0 means unlimited parallelism and all tasks will be scheduled at once.")
 	f.BoolVar(&l.DebugEngineTasks, "limits.debug-engine-tasks", false, "Experimental: Toggles verbose debug logging of tasks in the new query engine.")
 	f.BoolVar(&l.DebugEngineStreams, "limits.debug-engine-streams", false, "Experimental: Toggles verbose debug logging of data streams in the new query engine.")
+
+	l.SortSchema = DefaultSortSchema
+	f.Var(&l.SortSchema, "limits.sort-schema", "Experimental: Ordered, comma-separated sort keys for data objects, as `label:<name>,...`. Only the label type is currently supported. Defaults to "+DefaultSortSchema.String()+".")
 }
 
 // SetGlobalOTLPConfig set GlobalOTLPConfig which is used while unmarshaling per-tenant otlp config to use the default list of resource attributes picked as index labels.
@@ -607,6 +606,8 @@ func (l *Limits) UnmarshalYAML(value *yaml.Node) error {
 	// To make unmarshal fill the plain data struct rather than calling UnmarshalYAML
 	// again, we have to hide it using a type indirection.  See prometheus/config.
 	type plain Limits
+
+	defaultLimits := defaultLimits.Load()
 
 	// During startup we wont have a default value so we don't want to overwrite them
 	if defaultLimits != nil {
@@ -642,6 +643,15 @@ func (l *Limits) UnmarshalYAML(value *yaml.Node) error {
 
 // Validate validates that this limits config is valid.
 func (l *Limits) Validate() error {
+	switch l.LoglineQueryMode {
+	case "", "off", "dry_run", "live":
+	default:
+		return fmt.Errorf("invalid logline_query_mode %q: must be one of off, dry_run, live, or empty", l.LoglineQueryMode)
+	}
+	if l.LoglineQueryMinQueryBytesForIndex < 0 {
+		return fmt.Errorf("logline_query_min_query_bytes_for_index must be >= 0, got %d", l.LoglineQueryMinQueryBytesForIndex)
+	}
+
 	if l.StreamRetention != nil {
 		for i, rule := range l.StreamRetention {
 			matchers, err := syntax.ParseMatchers(rule.Selector, true)
@@ -660,6 +670,10 @@ func (l *Limits) Validate() error {
 		if err := l.PolicyStreamMapping.Validate(); err != nil {
 			return err
 		}
+	}
+
+	if err := l.ShardStreams.Validate(); err != nil {
+		return err
 	}
 
 	for policy, pl := range l.PolicyOverrideLimits {
@@ -709,6 +723,10 @@ func (l *Limits) Validate() error {
 		return fmt.Errorf("sort_schema: %w", err)
 	}
 
+	if l.DataObjLogCompactionEnabled && !l.DataObjIndexCompactionEnabled {
+		return errLogCompactionRequiresIndex
+	}
+
 	return nil
 }
 
@@ -716,13 +734,16 @@ func (l *Limits) Validate() error {
 // to default to any values specified on the command line, not default
 // command line values.  This global contains those values.  I (Tom) cannot
 // find a nicer way I'm afraid.
-var defaultLimits *Limits
+// Atomic because a process running more than one Loki instance, as the
+// integration tests do, sets it while another instance is reloading its runtime
+// config. Only ever replaced as a whole, never mutated once published.
+var defaultLimits atomic.Pointer[Limits]
 
 // SetDefaultLimitsForYAMLUnmarshalling sets global default limits, used when loading
 // Limits from YAML files. This is used to ensure per-tenant limits are defaulted to
 // those values.
 func SetDefaultLimitsForYAMLUnmarshalling(defaults Limits) {
-	defaultLimits = &defaults
+	defaultLimits.Store(&defaults)
 }
 
 type TenantLimits interface {
@@ -810,6 +831,12 @@ func (o *Overrides) UseOwnedStreamCount(userID string) bool {
 	return o.getOverridesForUser(userID).UseOwnedStreamCount
 }
 
+// DelegateStreamLimits returns whether the ingester skips its stream count limit checks for
+// the user, because the ingest-limits service enforces them instead.
+func (o *Overrides) DelegateStreamLimits(userID string) bool {
+	return o.getOverridesForUser(userID).DelegateStreamLimits
+}
+
 // MaxLocalStreamsPerUser returns the maximum number of streams a user is allowed to store
 // in a single ingester.
 func (o *Overrides) MaxLocalStreamsPerUser(userID string) int {
@@ -832,12 +859,8 @@ func (o *Overrides) MaxQueryLength(_ context.Context, userID string) time.Durati
 	return time.Duration(o.getOverridesForUser(userID).MaxQueryLength)
 }
 
-// Compatibility with Cortex interface, this method is set to be removed in 1.12,
-// so nooping in Loki until then.
-func (o *Overrides) MaxChunksPerQueryFromStore(_ string) int { return 0 }
-
 // MaxQuerySeries returns the limit of the series of metric queries.
-func (o *Overrides) MaxQuerySeries(_ context.Context, userID string) int {
+func (o *Overrides) MaxQuerySeries(userID string) int {
 	return o.getOverridesForUser(userID).MaxQuerySeries
 }
 
@@ -968,6 +991,11 @@ func (o *Overrides) MaxLineSizeTruncateIdentifier(userID string) string {
 	return o.getOverridesForUser(userID).MaxLineSizeTruncateIdentifier
 }
 
+// MaxPushSize returns the maximum size of a push request.
+func (o *Overrides) MaxPushSize(userID string) int {
+	return o.getOverridesForUser(userID).MaxPushSize.Val()
+}
+
 // MaxEntriesLimitPerQuery returns the limit to number of entries the querier should return per query.
 func (o *Overrides) MaxEntriesLimitPerQuery(_ context.Context, userID string) int {
 	return o.getOverridesForUser(userID).MaxEntriesLimitPerQuery
@@ -999,11 +1027,6 @@ func (o *Overrides) RulerTenantShardSize(userID string) int {
 	return o.getOverridesForUser(userID).RulerTenantShardSize
 }
 
-// RulerEnableWALReplay returns whether WAL replay is enabled for a given user.
-func (o *Overrides) RulerEnableWALReplay(userID string) bool {
-	return o.getOverridesForUser(userID).RulerEnableWALReplay
-}
-
 func (o *Overrides) IngestionPartitionsTenantShardSize(userID string) int {
 	return o.getOverridesForUser(userID).IngestionPartitionsTenantShardSize
 }
@@ -1019,7 +1042,7 @@ func (o *Overrides) RulerMaxRuleGroupsPerTenant(userID string) int {
 }
 
 // RulerAlertManagerConfig returns the alertmanager configurations to use for a given user.
-func (o *Overrides) RulerAlertManagerConfig(userID string) *ruler_config.AlertManagerConfig {
+func (o *Overrides) RulerAlertManagerConfig(userID string) *rulerconfig.AlertManagerConfig {
 	return o.getOverridesForUser(userID).RulerAlertManagerConfig
 }
 
@@ -1028,85 +1051,8 @@ func (o *Overrides) RulerRemoteWriteDisabled(userID string) bool {
 	return o.getOverridesForUser(userID).RulerRemoteWriteDisabled
 }
 
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteURL returns the remote-write URL to use for a given user.
-func (o *Overrides) RulerRemoteWriteURL(userID string) string {
-	return o.getOverridesForUser(userID).RulerRemoteWriteURL
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteTimeout returns the duration after which to timeout a remote-write request for a given user.
-func (o *Overrides) RulerRemoteWriteTimeout(userID string) time.Duration {
-	return o.getOverridesForUser(userID).RulerRemoteWriteTimeout
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteHeaders returns the headers to use in a remote-write for a given user.
-func (o *Overrides) RulerRemoteWriteHeaders(userID string) map[string]string {
-	return o.getOverridesForUser(userID).RulerRemoteWriteHeaders.Map()
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteRelabelConfigs returns the write relabel configs to use in a remote-write for a given user.
-func (o *Overrides) RulerRemoteWriteRelabelConfigs(userID string) []*util.RelabelConfig {
-	return o.getOverridesForUser(userID).RulerRemoteWriteRelabelConfigs
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteQueueCapacity returns the queue capacity to use in a remote-write for a given user.
-func (o *Overrides) RulerRemoteWriteQueueCapacity(userID string) int {
-	return o.getOverridesForUser(userID).RulerRemoteWriteQueueCapacity
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteQueueMinShards returns the minimum shards to use in a remote-write for a given user.
-func (o *Overrides) RulerRemoteWriteQueueMinShards(userID string) int {
-	return o.getOverridesForUser(userID).RulerRemoteWriteQueueMinShards
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteQueueMaxShards returns the maximum shards to use in a remote-write for a given user.
-func (o *Overrides) RulerRemoteWriteQueueMaxShards(userID string) int {
-	return o.getOverridesForUser(userID).RulerRemoteWriteQueueMaxShards
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteQueueMaxSamplesPerSend returns the max samples to send in a remote-write for a given user.
-func (o *Overrides) RulerRemoteWriteQueueMaxSamplesPerSend(userID string) int {
-	return o.getOverridesForUser(userID).RulerRemoteWriteQueueMaxSamplesPerSend
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteQueueBatchSendDeadline returns the maximum time a sample will be buffered before being discarded for a given user.
-func (o *Overrides) RulerRemoteWriteQueueBatchSendDeadline(userID string) time.Duration {
-	return o.getOverridesForUser(userID).RulerRemoteWriteQueueBatchSendDeadline
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteQueueMinBackoff returns the minimum time for an exponential backoff for a given user.
-func (o *Overrides) RulerRemoteWriteQueueMinBackoff(userID string) time.Duration {
-	return o.getOverridesForUser(userID).RulerRemoteWriteQueueMinBackoff
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteQueueMaxBackoff returns the maximum time for an exponential backoff for a given user.
-func (o *Overrides) RulerRemoteWriteQueueMaxBackoff(userID string) time.Duration {
-	return o.getOverridesForUser(userID).RulerRemoteWriteQueueMaxBackoff
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-// RulerRemoteWriteQueueRetryOnRateLimit returns whether to retry failed remote-write requests (429 response) for a given user.
-func (o *Overrides) RulerRemoteWriteQueueRetryOnRateLimit(userID string) bool {
-	return o.getOverridesForUser(userID).RulerRemoteWriteQueueRetryOnRateLimit
-}
-
-// Deprecated: use RulerRemoteWriteConfig instead
-func (o *Overrides) RulerRemoteWriteSigV4Config(userID string) *sigv4.SigV4Config {
-	return o.getOverridesForUser(userID).RulerRemoteWriteSigV4Config
-}
-
 // RulerRemoteWriteConfig returns the remote-write configurations to use for a given user and a given remote client.
-func (o *Overrides) RulerRemoteWriteConfig(userID string, id string) *config.RemoteWriteConfig {
+func (o *Overrides) RulerRemoteWriteConfig(userID string, id string) *rulerconfig.RemoteWriteConfig {
 	if c, ok := o.getOverridesForUser(userID).RulerRemoteWriteConfig[id]; ok {
 		return &c
 	}
@@ -1222,6 +1168,17 @@ func (o *Overrides) BloomCreationEnabled(userID string) bool {
 	return o.getOverridesForUser(userID).BloomCreationEnabled
 }
 
+// CompactionPhases returns which dataobj compaction phases run for the tenant.
+// runIndex is true when either index or log compaction is enabled; runLog is
+// true only when log compaction is enabled.
+func (o *Overrides) CompactionPhases(userID string) (runIndex, runLog bool) {
+	l := o.getOverridesForUser(userID)
+	// runIndex stays correct (index || log) even if Validate's log-implies-index
+	// rule is ever bypassed, e.g. by an unvalidated runtime override.
+	return l.DataObjIndexCompactionEnabled || l.DataObjLogCompactionEnabled,
+		l.DataObjLogCompactionEnabled
+}
+
 func (o *Overrides) BloomPlanningStrategy(userID string) string {
 	return o.getOverridesForUser(userID).BloomPlanningStrategy
 }
@@ -1331,6 +1288,14 @@ func (o *Overrides) ShardAggregations(userID string) []string {
 	return o.getOverridesForUser(userID).ShardAggregations
 }
 
+func (o *Overrides) LoglineQueryMode(userID string) string {
+	return o.getOverridesForUser(userID).LoglineQueryMode
+}
+
+func (o *Overrides) LoglineQueryMinQueryBytesForIndex(userID string) int64 {
+	return o.getOverridesForUser(userID).LoglineQueryMinQueryBytesForIndex
+}
+
 func (o *Overrides) PatternIngesterTokenizableJSONFields(userID string) []string {
 	defaultFields := o.getOverridesForUser(userID).PatternIngesterTokenizableJSONFieldsDefault
 	appendFields := o.getOverridesForUser(userID).PatternIngesterTokenizableJSONFieldsAppend
@@ -1382,10 +1347,6 @@ func (o *Overrides) PatternRateThreshold(userID string) float64 {
 	return o.getOverridesForUser(userID).PatternRateThreshold
 }
 
-func (o *Overrides) EnableMultiVariantQueries(userID string) bool {
-	return o.getOverridesForUser(userID).EnableMultiVariantQueries
-}
-
 // S3SSEType returns the per-tenant S3 SSE type.
 func (o *Overrides) S3SSEType(user string) string {
 	return o.getOverridesForUser(user).S3SSEType
@@ -1401,8 +1362,16 @@ func (o *Overrides) S3SSEKMSEncryptionContext(user string) string {
 	return o.getOverridesForUser(user).S3SSEKMSEncryptionContext
 }
 
-func (o *Overrides) MaxScanTaskParallelism(userID string) int {
-	return o.getOverridesForUser(userID).MaxScanTaskParallelism
+// DataObjQueryStartTime returns the time from which the querier reads the tenant's stream-first
+// metric queries from data objects. The zero time disables it.
+func (o *Overrides) DataObjQueryStartTime(userID string) time.Time {
+	return time.Time(o.getOverridesForUser(userID).DataObjQueryStartTime)
+}
+
+// StreamFirstExecutionEnabled reports whether eligible metric queries of the tenant run in
+// stream-first sample order.
+func (o *Overrides) StreamFirstExecutionEnabled(userID string) bool {
+	return o.getOverridesForUser(userID).StreamFirstExecutionEnabled
 }
 
 func (o *Overrides) DebugEngineTasks(userID string) bool {

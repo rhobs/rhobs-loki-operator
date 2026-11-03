@@ -15,18 +15,14 @@ SHELL = /usr/bin/env bash -o pipefail
 # want to speed up development you can run make BUILD_IN_CONTAINER=false target
 # or you can override this with an environment variable.
 BUILD_IN_CONTAINER ?= true
+# Unless NONINTERACTIVE is set, docker will be run interactive if it has a TTY
+# attached at launch time.
 NONINTERACTIVE     ?= false
+TTY_TEST           := $(if $(filter true,$(NONINTERACTIVE)),false,[ -t 0 ])
 CI                 ?= false
 
-# Docker flags for container interaction
-ifeq ($(NONINTERACTIVE),true)
-DOCKER_INTERACTIVE_FLAGS :=
-else
-DOCKER_INTERACTIVE_FLAGS := --tty --interactive
-endif
-
 # Ensure you run `make update-go-version` after changing this
-GO_VERSION         := 1.26.4
+GO_VERSION         := 1.27.1
 
 IMAGE_TAG          ?= $(shell ./tools/image-tag)
 GIT_REVISION       := $(shell git rev-parse --short HEAD)
@@ -56,6 +52,8 @@ else
   GO_FLAGS := -ldflags "-s -w $(GO_LDFLAGS)" -tags netgo
 endif
 DYN_GO_FLAGS       := -ldflags "-s -w $(GO_LDFLAGS)" -tags netgo
+# -race cannot be combined with -s/-w or -extldflags -static.
+GO_TEST_FLAGS      := -ldflags "$(GO_LDFLAGS)" -tags netgo
 
 # Per some websites I've seen to add `-gcflags "all=-N -l"`, the gcflags seem poorly if at all documented
 # the best I could dig up is -N disables optimizations and -l disables inlining which should make debugging match source better.
@@ -113,17 +111,19 @@ define run_in_container
 			fi; \
 		fi))
 
-	@docker build --rm $(OCI_BUILD_ARGS) --build-arg "SRC_DIR=/src/loki" --build-arg "INSTALL_WORKFLOW_DEPS_ARGS=$(INSTALL_WORKFLOW_DEPS_ARGS)" \
+	@docker build --rm $(OCI_BUILD_ARGS) --build-arg "USER=$(shell whoami)" --build-arg "USER_UID=$(shell id -u)" --build-arg "USER_GID=$(shell id -g)" --build-arg "SRC_DIR=/src/loki" --build-arg "INSTALL_WORKFLOW_DEPS_ARGS=$(INSTALL_WORKFLOW_DEPS_ARGS)" \
 		-f loki-build-image/Dockerfile \
 		-t $(MAKEFILE_IMAGE) \
 		.
 
-	@docker run --rm $(DOCKER_INTERACTIVE_FLAGS) \
+	@if $(TTY_TEST); then INTERACTIVE_FLAGS='--tty --interactive'; else INTERACTIVE_FLAGS=''; fi; \
+	docker run --rm $$INTERACTIVE_FLAGS \
 		-v $(shell pwd)/.pkg:/go/pkg$(MOUNT_FLAGS) \
 		-v $(shell pwd)/.cache:/go/cache$(MOUNT_FLAGS) \
 		-v $(shell pwd):/src/loki$(MOUNT_FLAGS) \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		$(GIT_MOUNT) \
+		--user $(shell whoami) \
 		--entrypoint /usr/bin/make \
 		-e SRC_DIR=/src/loki \
 		-e BUILD_IN_CONTAINER=false \
@@ -269,9 +269,6 @@ production/helm/loki/src/helm-test/helm-test:
 helm-lint: ## run helm linter
 	$(MAKE) -BC production/helm/loki lint
 
-helm-docs: ## generate reference documentation
-	$(MAKE) -BC docs sources/setup/install/helm/reference.md
-
 #################
 # Loki-QueryTee #
 #################
@@ -290,13 +287,21 @@ lokitool: cmd/lokitool/lokitool ## build lokitool executable
 cmd/lokitool/lokitool:
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./cmd/lokitool
 
+##################
+# chunks-inspect #
+##################
+.PHONY: cmd/chunks-inspect/chunks-inspect
+chunks-inspect: cmd/chunks-inspect/chunks-inspect ## build chunks-inspect executable
+
+cmd/chunks-inspect/chunks-inspect:
+	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./cmd/chunks-inspect
+
 #########
 # Mixin #
 #########
 
 MIXIN_PATH := production/loki-mixin
 MIXIN_OUT_PATH := production/loki-mixin-compiled
-MIXIN_OUT_PATH_SSD := production/loki-mixin-compiled-ssd
 
 loki-mixin: INSTALL_WORKFLOW_DEPS_ARGS := loki-build-tools
 loki-mixin: ## compile the loki mixin
@@ -306,16 +311,11 @@ else
 	@rm -rf $(MIXIN_OUT_PATH) && mkdir $(MIXIN_OUT_PATH)
 	@cd $(MIXIN_PATH) && jb install
 	@mixtool generate all --output-alerts $(MIXIN_OUT_PATH)/alerts.yaml --output-rules $(MIXIN_OUT_PATH)/rules.yaml --directory $(MIXIN_OUT_PATH)/dashboards ${MIXIN_PATH}/mixin.libsonnet
-
-	@rm -rf $(MIXIN_OUT_PATH_SSD) && mkdir $(MIXIN_OUT_PATH_SSD)
-	@cd $(MIXIN_PATH) && jb install
-	@mixtool generate all --output-alerts $(MIXIN_OUT_PATH_SSD)/alerts.yaml --output-rules $(MIXIN_OUT_PATH_SSD)/rules.yaml --directory $(MIXIN_OUT_PATH_SSD)/dashboards ${MIXIN_PATH}/mixin-ssd.libsonnet
 endif
 
 loki-mixin-check: loki-mixin ## check the loki mixin is up to date
 	@echo "Checking diff"
 	@git diff --exit-code -- $(MIXIN_OUT_PATH) || (echo "Please build mixin by running 'make loki-mixin'" && false)
-	@git diff --exit-code -- $(MIXIN_OUT_PATH_SSD) || (echo "Please build mixin by running 'make loki-mixin'" && false)
 
 ###############
 # Migrate #
@@ -367,10 +367,8 @@ include crosscompile.mk
 ########
 ifeq ($(UNAME_S),Linux)
 LINT_FLAGS=--timeout=15m --build-tags=linux
-GOFLAGS=-tags=linux
 else
 LINT_FLAGS=--timeout=15m
-GOFLAGS=""
 endif
 lint: INSTALL_WORKFLOW_DEPS_ARGS := lint loki-release
 lint: ## run linters
@@ -380,19 +378,6 @@ else
 	go version
 	golangci-lint version
 	golangci-lint run -v $(LINT_FLAGS)
-	GOFLAGS=$(GOFLAGS) faillint -paths \
-		"sync/atomic=go.uber.org/atomic" \
-		./...
-
-	# Use our spanlogger implementation instead of the one in dskit to make sure we use the correct tracing lib.
-	faillint -paths \
-		"github.com/grafana/dskit/spanlogger=github.com/grafana/loki/pkg/util/spanlogger" \
-		./...
-
-	# We don't use opentracing anymore.
-	faillint -paths \
-		"github.com/opentracing/opentracing-go,github.com/opentracing/opentracing-go/log,github.com/uber/jaeger-client-go,github.com/opentracing-contrib/go-stdlib/nethttp" \
-		./...
 endif
 
 ########
@@ -400,11 +385,11 @@ endif
 ########
 
 test: all ## run the unit tests
-	go test $(GO_FLAGS) -covermode=atomic -coverprofile=coverage.txt -p=4 ./... | tee test_results.txt
+	go test -race $(GO_TEST_FLAGS) -covermode=atomic -coverprofile=coverage.txt -p=4 ./... | tee test_results.txt
 
 
 test-integration:
-	$(GOTEST) -count=1 -v -tags=integration -timeout 15m ./integration
+	$(GOTEST) -race -count=1 -v -tags=integration -timeout 15m ./integration
 
 compare-coverage:
 	./tools/diff_coverage.sh $(old) $(new) $(packages)
@@ -421,6 +406,7 @@ clean: ## clean the generated files
 	rm -rf clients/cmd/docker-driver/rootfs
 	rm -rf clients/cmd/fluent-bit/out_grafana_loki.h
 	rm -rf clients/cmd/fluent-bit/out_grafana_loki.so
+	rm -rf cmd/chunks-inspect/chunks-inspect
 	rm -rf cmd/logcli/logcli
 	rm -rf cmd/logql-analyzer/logql-analyzer
 	rm -rf cmd/loki-canary/loki-canary
@@ -648,11 +634,6 @@ loki-operator-image: ## build the operator docker image
 #################
 # Documentation #
 #################
-
-documentation-helm-reference-check:
-	@echo "Checking diff"
-	$(MAKE) -BC docs sources/setup/install/helm/reference.md
-	@git diff --exit-code -- docs/sources/setup/install/helm/reference.md || (echo "Please generate Helm Chart reference by running 'make -C docs sources/setup/install/helm/reference.md'" && false)
 
 ########
 # Misc #

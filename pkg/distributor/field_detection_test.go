@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/grafana/dskit/flagext"
 	ring_client "github.com/grafana/dskit/ring/client"
@@ -18,6 +19,85 @@ import (
 
 	"github.com/grafana/loki/pkg/push"
 )
+
+func TestDistributor_SharedFieldDetection(t *testing.T) {
+	attrs := buildNestedAttrs
+	for _, tc := range []struct {
+		name                 string
+		streamLabels         string
+		resource, scope, own []logproto.LabelAdapter
+		levelFields          []string
+		wantLevel, wantOrg   string
+	}{
+		{name: "resource fields", resource: attrs("level", "INFO", "user_id", "resource"), wantLevel: "info", wantOrg: "resource"},
+		{name: "scope overrides resource", resource: attrs("level", "INFO", "user_id", "resource"), scope: attrs("level", "WARN", "user_id", "scope"), wantLevel: "warn", wantOrg: "scope"},
+		{name: "entry overrides scope and resource", resource: attrs("level", "INFO", "user_id", "resource"), scope: attrs("level", "WARN", "user_id", "scope"), own: attrs("level", "ERROR", "user_id", "entry"), wantLevel: "error", wantOrg: "entry"},
+		{name: "stream labels take precedence", streamLabels: `{app="shared", level="TRACE", user_id="stream"}`, resource: attrs("level", "INFO", "user_id", "resource"), own: attrs("level", "ERROR", "user_id", "entry"), wantLevel: "trace", wantOrg: "stream"},
+		{name: "hint order precedes metadata location", resource: attrs("level", "INFO", "user_id", "resource"), scope: attrs("severity", "WARN", "tenant_id", "scope"), own: attrs("severity", "ERROR", "tenant_id", "entry"), wantLevel: "info", wantOrg: "resource"},
+		{name: "empty entry values are removed before shared lookup", resource: attrs("level", "INFO", "user_id", "resource"), scope: attrs("level", "WARN", "user_id", "scope"), own: attrs("level", "", "user_id", ""), wantLevel: "warn", wantOrg: "scope"},
+		{name: "empty scope values are removed before resource lookup", resource: attrs("level", "INFO", "user_id", "resource"), scope: attrs("level", "", "user_id", ""), wantLevel: "info", wantOrg: "resource"},
+		{name: "resource detected level is preserved", streamLabels: `{app="shared", level="TRACE"}`, resource: attrs("detected_level", "WaRn"), own: attrs("level", "ERROR"), wantLevel: "warn", wantOrg: "line"},
+		{name: "scope detected level overrides resource", resource: attrs("detected_level", "WARN"), scope: attrs("detected_level", "ERROR"), wantLevel: "error", wantOrg: "line"},
+		{name: "entry detected level overrides shared values", resource: attrs("detected_level", "WARN"), scope: attrs("detected_level", "ERROR"), own: attrs("detected_level", "TrAcE"), wantLevel: "trace", wantOrg: "line"},
+		{name: "empty detected level is removed", resource: attrs("detected_level", "WARN"), scope: attrs("detected_level", ""), wantLevel: "warn", wantOrg: "line"},
+		{name: "detected level normalized after name collisions", resource: attrs("detected.level", "WARN", "detected_level", "INFO"), wantLevel: "warn", wantOrg: "line"},
+		{name: "normalized names are searched", resource: attrs("log.level", "INFO", "user.id", "resource"), levelFields: []string{"log_level"}, wantLevel: "info", wantOrg: "resource"},
+		{name: "normalized entry names override shared names", resource: attrs("level", "INFO", "user.id", "resource"), scope: attrs("user-id", "scope"), own: attrs("user_id", "entry"), wantLevel: "info", wantOrg: "entry"},
+		{name: "resource severity number", resource: attrs(loghttp_push.OTLPSeverityNumber, "17"), wantLevel: "error", wantOrg: "line"},
+		{name: "scope severity number overrides resource", resource: attrs(loghttp_push.OTLPSeverityNumber, "17"), scope: attrs(loghttp_push.OTLPSeverityNumber, "5"), wantLevel: "debug", wantOrg: "line"},
+		{name: "entry severity number overrides shared values", resource: attrs(loghttp_push.OTLPSeverityNumber, "17"), scope: attrs(loghttp_push.OTLPSeverityNumber, "5"), own: attrs(loghttp_push.OTLPSeverityNumber, "9"), wantLevel: "info", wantOrg: "line"},
+		{name: "invalid shared severity number", resource: attrs(loghttp_push.OTLPSeverityNumber, "invalid"), wantLevel: "info", wantOrg: "line"},
+		{name: "empty severity number is removed before shared lookup", resource: attrs(loghttp_push.OTLPSeverityNumber, "17"), own: attrs(loghttp_push.OTLPSeverityNumber, ""), wantLevel: "error", wantOrg: "line"},
+		{name: "line fallback", wantLevel: "fatal", wantOrg: "line"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lim := &validation.Limits{}
+			flagext.DefaultValues(lim)
+			lim.DiscoverLogLevels = true
+			lim.LogLevelFields = []string{"level", "severity"}
+			if tc.levelFields != nil {
+				lim.LogLevelFields = tc.levelFields
+			}
+			lim.DiscoverGenericFields.Fields = map[string][]string{"org_id": {"user_id", "tenant_id"}}
+			ing := &mockIngester{}
+			distributors, _ := prepare(t, 1, 3, lim, func(_ string) (ring_client.PoolClient, error) { return ing, nil })
+			d := distributors[0]
+			ls := tc.streamLabels
+			if ls == "" {
+				ls = `{app="shared"}`
+			}
+			req := &logproto.InternalPushRequest{Streams: []logproto.InternalStreamAdapter{{Labels: ls, ResourceLogs: []logproto.ResourceLogs{{Attrs: tc.resource, ScopeLogs: []logproto.ScopeLogs{{
+				Attrs: tc.scope, Entries: []logproto.Entry{{Timestamp: time.Now(), Line: `{"level":"fatal", "user_id":"line"}`, StructuredMetadata: tc.own}},
+			}}}}}}}
+			_, err := d.pushWithResolver(ctx, req, newRequestScopedStreamResolver("test", d.validator.Limits, nil), constants.Loki)
+			require.NoError(t, err)
+			got := ing.Peek()
+			require.NotNil(t, got)
+			require.Len(t, got.Streams, 1)
+			require.Len(t, got.Streams[0].Entries, 1)
+			metadata := got.Streams[0].Entries[0].StructuredMetadata
+			var levels, orgs []string
+			for _, attr := range metadata {
+				switch attr.Name {
+				case constants.LevelLabel:
+					levels = append(levels, attr.Value)
+				case "org_id":
+					orgs = append(orgs, attr.Value)
+				}
+			}
+			if tc.wantLevel != "" {
+				require.Equal(t, []string{tc.wantLevel}, levels)
+			} else {
+				require.Empty(t, levels)
+			}
+			if tc.wantOrg != "" {
+				require.Equal(t, []string{tc.wantOrg}, orgs)
+			} else {
+				require.Empty(t, orgs)
+			}
+		})
+	}
+}
 
 func Test_DetectLogLevels(t *testing.T) {
 	setup := func(discoverLogLevels bool) (*validation.Limits, *mockIngester) {
@@ -222,6 +302,8 @@ func Test_DetectLogLevels(t *testing.T) {
 			{`{foo="bar", level="Debug"}`, constants.LogLevelDebug},
 			{`{foo="bar", level="FaTaL"}`, constants.LogLevelFatal},
 			{`{foo="bar", level="tRaCe"}`, constants.LogLevelTrace},
+			{`{foo="bar", level="informational"}`, "informational"},
+			{`{foo="bar", level="notice"}`, "notice"},
 		}
 
 		for _, tc := range testCases {
@@ -786,6 +868,78 @@ func Test_detectLogLevelFromLogEntryWithCustomLabels(t *testing.T) {
 			require.Equal(t, tc.expectedLogLevel, detectedLogLevel)
 		})
 	}
+}
+
+// Test_detectLogLevelFromOTLPSeverityNumber tests level detection against the OTLP severity_number
+func Test_detectLogLevelFromOTLPSeverityNumber(t *testing.T) {
+	ld := newFieldDetector(
+		validationContext{
+			discoverLogLevels:       true,
+			allowStructuredMetadata: true,
+			logLevelFields:          []string{"level", "LEVEL", "Level", "severity", "SEVERITY", "Severity", "lvl", "LVL", "Lvl"},
+		})
+
+	entryWithSeverityNumber := func(value string) logproto.Entry {
+		return logproto.Entry{
+			Line: "some log message",
+			StructuredMetadata: push.LabelsAdapter{
+				{Name: loghttp_push.OTLPSeverityNumber, Value: value},
+			},
+		}
+	}
+
+	t.Run("named severity numbers map to their band", func(t *testing.T) {
+		for _, tc := range []struct {
+			name             string
+			severityNumber   plog.SeverityNumber
+			expectedLogLevel string
+		}{
+			// Trace band (1-4)
+			{"trace lower bound", plog.SeverityNumberTrace, constants.LogLevelTrace},
+			{"trace upper bound", plog.SeverityNumberTrace4, constants.LogLevelTrace},
+			// Debug band (5-8)
+			{"debug lower bound", plog.SeverityNumberDebug, constants.LogLevelDebug},
+			{"debug upper bound", plog.SeverityNumberDebug2, constants.LogLevelDebug},
+			{"debug upper bound", plog.SeverityNumberDebug4, constants.LogLevelDebug},
+			// Info band (9-12)
+			{"info lower bound", plog.SeverityNumberInfo, constants.LogLevelInfo},
+			{"info upper bound", plog.SeverityNumberInfo4, constants.LogLevelInfo},
+			// Warn band (13-16)
+			{"warn lower bound", plog.SeverityNumberWarn, constants.LogLevelWarn},
+			{"warn upper bound", plog.SeverityNumberWarn4, constants.LogLevelWarn},
+			// Error band (17-20)
+			{"error lower bound", plog.SeverityNumberError, constants.LogLevelError},
+			{"error upper bound", plog.SeverityNumberError4, constants.LogLevelError},
+			// Fatal band (21-24)
+			{"fatal lower bound", plog.SeverityNumberFatal, constants.LogLevelFatal},
+			{"fatal upper bound", plog.SeverityNumberFatal4, constants.LogLevelFatal},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				entry := entryWithSeverityNumber(fmt.Sprintf("%d", tc.severityNumber))
+				detectedLogLevel := ld.detectLogLevelFromLogEntry(entry, logproto.FromLabelAdaptersToLabels(entry.StructuredMetadata))
+				require.Equal(t, tc.expectedLogLevel, detectedLogLevel, "severity number: %d", tc.severityNumber)
+			})
+		}
+	})
+
+	t.Run("out-of-range and invalid severity numbers", func(t *testing.T) {
+		for _, tc := range []struct {
+			name             string
+			value            string
+			expectedLogLevel string
+		}{
+			{"unspecified maps to unknown", fmt.Sprintf("%d", plog.SeverityNumberUnspecified), constants.LogLevelUnknown},
+			{"just above fatal4 maps to unknown", "25", constants.LogLevelUnknown},
+			{"well above the range maps to unknown", "100", constants.LogLevelUnknown},
+			{"non-numeric value falls back to info", "foo", constants.LogLevelInfo},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				entry := entryWithSeverityNumber(tc.value)
+				detectedLogLevel := ld.detectLogLevelFromLogEntry(entry, logproto.FromLabelAdaptersToLabels(entry.StructuredMetadata))
+				require.Equal(t, tc.expectedLogLevel, detectedLogLevel, "severity number value: %s", tc.value)
+			})
+		}
+	})
 }
 
 func Benchmark_extractLogLevelFromLogLine(b *testing.B) {

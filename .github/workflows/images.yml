@@ -1,18 +1,18 @@
 "jobs":
   "check":
-    "uses": "grafana/loki-release/.github/workflows/check.yml@1e32d81ad6fbbd8c271e0bf79ce84c3e65efb0d3"
+    "uses": "grafana/loki-release/.github/workflows/check.yml@4587d0b45edcb18585ff09f4e5dd1ed1174efeb6"
     "with":
-      "build_image": "golang:1.26.4"
-      "golang_ci_lint_version": "v2.10.1"
-      "release_lib_ref": "1e32d81ad6fbbd8c271e0bf79ce84c3e65efb0d3"
+      "build_image": "golang:1.27.1"
+      "golang_ci_lint_version": "v2.13.2"
+      "release_lib_ref": "4587d0b45edcb18585ff09f4e5dd1ed1174efeb6"
       "skip_validation": false
       "use_github_app_token": true
   "logql-analyzer-image":
     "env":
       "BUILD_TIMEOUT": 60
-      "GO_VERSION": "1.26.4"
+      "GO_VERSION": "1.27.1"
       "IMAGE_PREFIX": "us-docker.pkg.dev/grafanalabs-global/dockerhub-loki-prod-mirror"
-      "RELEASE_LIB_REF": "1e32d81ad6fbbd8c271e0bf79ce84c3e65efb0d3"
+      "RELEASE_LIB_REF": "4587d0b45edcb18585ff09f4e5dd1ed1174efeb6"
       "RELEASE_REPO": "grafana/loki"
     "needs":
     - "check"
@@ -28,20 +28,20 @@
     "runs-on": "${{ matrix.runs_on }}"
     "steps":
     - "name": "pull release library code"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "lib"
         "persist-credentials": false
         "ref": "${{ env.RELEASE_LIB_REF }}"
         "repository": "grafana/loki-release"
     - "name": "pull code to release"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "release"
         "persist-credentials": false
         "repository": "${{ env.RELEASE_REPO }}"
     - "name": "setup node"
-      "uses": "actions/setup-node@v4"
+      "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"
       "with":
         "node-version": 24
         "package-manager-cache": false
@@ -150,9 +150,9 @@
   "loki-canary-boringcrypto-image":
     "env":
       "BUILD_TIMEOUT": 60
-      "GO_VERSION": "1.26.4"
+      "GO_VERSION": "1.27.1"
       "IMAGE_PREFIX": "us-docker.pkg.dev/grafanalabs-global/dockerhub-loki-prod-mirror"
-      "RELEASE_LIB_REF": "1e32d81ad6fbbd8c271e0bf79ce84c3e65efb0d3"
+      "RELEASE_LIB_REF": "4587d0b45edcb18585ff09f4e5dd1ed1174efeb6"
       "RELEASE_REPO": "grafana/loki"
     "needs":
     - "check"
@@ -168,20 +168,20 @@
     "runs-on": "${{ matrix.runs_on }}"
     "steps":
     - "name": "pull release library code"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "lib"
         "persist-credentials": false
         "ref": "${{ env.RELEASE_LIB_REF }}"
         "repository": "grafana/loki-release"
     - "name": "pull code to release"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "release"
         "persist-credentials": false
         "repository": "${{ env.RELEASE_REPO }}"
     - "name": "setup node"
-      "uses": "actions/setup-node@v4"
+      "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"
       "with":
         "node-version": 24
         "package-manager-cache": false
@@ -290,9 +290,9 @@
   "loki-canary-image":
     "env":
       "BUILD_TIMEOUT": 60
-      "GO_VERSION": "1.26.4"
+      "GO_VERSION": "1.27.1"
       "IMAGE_PREFIX": "us-docker.pkg.dev/grafanalabs-global/dockerhub-loki-prod-mirror"
-      "RELEASE_LIB_REF": "1e32d81ad6fbbd8c271e0bf79ce84c3e65efb0d3"
+      "RELEASE_LIB_REF": "4587d0b45edcb18585ff09f4e5dd1ed1174efeb6"
       "RELEASE_REPO": "grafana/loki"
     "needs":
     - "check"
@@ -308,20 +308,20 @@
     "runs-on": "${{ matrix.runs_on }}"
     "steps":
     - "name": "pull release library code"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "lib"
         "persist-credentials": false
         "ref": "${{ env.RELEASE_LIB_REF }}"
         "repository": "grafana/loki-release"
     - "name": "pull code to release"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "release"
         "persist-credentials": false
         "repository": "${{ env.RELEASE_REPO }}"
     - "name": "setup node"
-      "uses": "actions/setup-node@v4"
+      "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"
       "with":
         "node-version": 24
         "package-manager-cache": false
@@ -430,9 +430,9 @@
   "loki-image":
     "env":
       "BUILD_TIMEOUT": 60
-      "GO_VERSION": "1.26.4"
+      "GO_VERSION": "1.27.1"
       "IMAGE_PREFIX": "us-docker.pkg.dev/grafanalabs-global/dockerhub-loki-prod-mirror"
-      "RELEASE_LIB_REF": "1e32d81ad6fbbd8c271e0bf79ce84c3e65efb0d3"
+      "RELEASE_LIB_REF": "4587d0b45edcb18585ff09f4e5dd1ed1174efeb6"
       "RELEASE_REPO": "grafana/loki"
     "needs":
     - "check"
@@ -448,20 +448,20 @@
     "runs-on": "${{ matrix.runs_on }}"
     "steps":
     - "name": "pull release library code"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "lib"
         "persist-credentials": false
         "ref": "${{ env.RELEASE_LIB_REF }}"
         "repository": "grafana/loki-release"
     - "name": "pull code to release"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "release"
         "persist-credentials": false
         "repository": "${{ env.RELEASE_REPO }}"
     - "name": "setup node"
-      "uses": "actions/setup-node@v4"
+      "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"
       "with":
         "node-version": 24
         "package-manager-cache": false
@@ -570,9 +570,9 @@
   "loki-query-tee-image":
     "env":
       "BUILD_TIMEOUT": 60
-      "GO_VERSION": "1.26.4"
+      "GO_VERSION": "1.27.1"
       "IMAGE_PREFIX": "us-docker.pkg.dev/grafanalabs-global/dockerhub-loki-prod-mirror"
-      "RELEASE_LIB_REF": "1e32d81ad6fbbd8c271e0bf79ce84c3e65efb0d3"
+      "RELEASE_LIB_REF": "4587d0b45edcb18585ff09f4e5dd1ed1174efeb6"
       "RELEASE_REPO": "grafana/loki"
     "needs":
     - "check"
@@ -588,20 +588,20 @@
     "runs-on": "${{ matrix.runs_on }}"
     "steps":
     - "name": "pull release library code"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "lib"
         "persist-credentials": false
         "ref": "${{ env.RELEASE_LIB_REF }}"
         "repository": "grafana/loki-release"
     - "name": "pull code to release"
-      "uses": "actions/checkout@v4"
+      "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       "with":
         "path": "release"
         "persist-credentials": false
         "repository": "${{ env.RELEASE_REPO }}"
     - "name": "setup node"
-      "uses": "actions/setup-node@v4"
+      "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"
       "with":
         "node-version": 24
         "package-manager-cache": false
@@ -707,26 +707,6 @@
           ${IMAGE_NAME}@${IMAGE_DIGEST_AMD64} \
           ${IMAGE_NAME}@${IMAGE_DIGEST_ARM}
         docker buildx imagetools inspect $IMAGE
-  "trigger-cd":
-    "env":
-      "IMAGE_TAG": "${{ needs.loki-image.outputs.image_tag }}"
-    "if": "github.ref == 'refs/heads/main'"
-    "needs":
-    - "loki-image"
-    - "loki-manifest"
-    - "loki-canary-manifest"
-    "permissions":
-      "contents": "read"
-      "id-token": "write"
-    "runs-on": "ubuntu-x64"
-    "steps":
-    - "name": "Trigger CD workflow"
-      "uses": "grafana/shared-workflows/actions/trigger-argo-workflow@8b88213bca76e86f9f59b43038cc5d7545452436"
-      "with":
-        "instance": "ops"
-        "namespace": "loki-cd"
-        "parameters": "imageTag=${{ env.IMAGE_TAG }}"
-        "workflow_template": "loki-continuous-deployment"
 "name": "Publish images"
 "on":
   "push":

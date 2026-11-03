@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -13,7 +14,7 @@ import (
 // CharSet combines start-end rune ranges and unicode categories representing a set of characters
 type CharSet struct {
 	ranges     []SingleRange
-	categories []Category
+	categories []charCategory
 	sub        *CharSet //optional subtractor
 	negate     bool
 	anything   bool
@@ -28,6 +29,21 @@ type asciiBitmap struct {
 type Category struct {
 	Negate bool
 	Cat    string
+}
+
+// Keep the public Category representation unchanged. Shared ECMAScript sets
+// are immutable and can be retained when a character set is copied or merged.
+type charCategory struct {
+	Category
+	set *CharSet
+}
+
+func newCharCategory(category Category) charCategory {
+	ct := charCategory{Category: category}
+	if strings.HasPrefix(category.Cat, ecmaPropertyPrefix) {
+		ct.set = ecmaPropertySet(category.Cat)
+	}
+	return ct
 }
 
 type SingleRange struct {
@@ -87,6 +103,9 @@ var unicodeCategories = func() map[string]*unicode.RangeTable {
 	for k, v := range unicode.Properties {
 		retVal[k] = v
 	}
+	for k, v := range unicodeAliasCategories {
+		retVal[k] = v
+	}
 	return retVal
 }()
 
@@ -97,9 +116,9 @@ func getCharSetFromCategoryString(negateSet bool, negateCat bool, cats ...string
 
 	c := CharSet{negate: negateSet}
 
-	c.categories = make([]Category, len(cats))
+	c.categories = make([]charCategory, len(cats))
 	for i, cat := range cats {
-		c.categories[i] = Category{Cat: cat, Negate: negateCat}
+		c.categories[i] = newCharCategory(Category{Cat: cat, Negate: negateCat})
 	}
 	return func() *CharSet {
 		//make a copy each time
@@ -266,7 +285,7 @@ func NewCharSetRuntime(buf string) CharSet {
 		retVal.ranges[i] = r
 	}
 
-	retVal.categories = make([]Category, lenCats)
+	retVal.categories = make([]charCategory, lenCats)
 	for i := 0; i < int(lenCats); i++ {
 		var lenCat int8
 		c := Category{}
@@ -276,7 +295,7 @@ func NewCharSetRuntime(buf string) CharSet {
 			lenCat *= -1
 		}
 		c.Cat = string(b.Next(int(lenCat)))
-		retVal.categories[i] = c
+		retVal.categories[i] = newCharCategory(c)
 	}
 
 	//sub
@@ -291,13 +310,20 @@ func NewCharSetRuntime(buf string) CharSet {
 // CharIn returns true if the rune is in our character set (either ranges or categories).
 // It handles negations and subtracted sub-charsets.
 func (c CharSet) CharIn(ch rune) bool {
+	return c.Contains(ch)
+}
+
+// Contains reports whether ch is in the character set, including negation and
+// subtraction. It is equivalent to CharIn but avoids copying the set on each
+// call when testing many runes.
+func (c *CharSet) Contains(ch rune) bool {
 	if ch >= 0 && ch < 128 && c.ascii != nil {
 		return (c.ascii.bits[ch/64] & (1 << (uint(ch) % 64))) != 0
 	}
 	return c.charInSlow(ch)
 }
 
-func (c CharSet) charInSlow(ch rune) bool {
+func (c *CharSet) charInSlow(ch rune) bool {
 	val := false
 	// in s && !s.subtracted
 
@@ -342,7 +368,7 @@ func (c CharSet) charInSlow(ch rune) bool {
 
 	// get subtracted recurse
 	if val && c.sub != nil {
-		val = !c.sub.CharIn(ch)
+		val = !c.sub.Contains(ch)
 	}
 
 	//log.Printf("Char '%v' in %v == %v", string(ch), c.String(), val)
@@ -367,6 +393,14 @@ func (c *CharSet) prepareASCIIBitmap() {
 
 func (c *CharSet) charInCategories(ch rune) bool {
 	for _, ct := range c.categories {
+		if ct.set != nil {
+			if ct.set.Contains(ch) != ct.Negate {
+				return true
+			}
+			// Each category contributes to a union. Failure to match one
+			// property must not prevent a later property from matching.
+			continue
+		}
 		// special categories...then unicode
 		if ct.Cat == SpaceCategoryText {
 			if unicode.IsSpace(ch) {
@@ -395,6 +429,13 @@ func (c *CharSet) charInCategories(ch rune) bool {
 }
 
 func (c Category) String() string {
+	if flags, ok := strings.CutPrefix(c.Cat, ecmaPropertyPrefix); ok {
+		escape := "\\p{"
+		if (flags[0] == 'P') != c.Negate {
+			escape = "\\P{"
+		}
+		return escape + flags[2:] + "}"
+	}
 	switch c.Cat {
 	case SpaceCategoryText:
 		if c.Negate {
@@ -562,17 +603,25 @@ func (c *CharSet) addSet(set CharSet) {
 	}
 	// just append here to prevent double-canon
 	c.ranges = append(c.ranges, set.ranges...)
-	c.addCategories(set.categories...)
+	for _, ct := range set.categories {
+		c.addCharCategory(ct)
+	}
 	c.canonicalize()
 }
 
 func (c *CharSet) makeAnything() {
 	c.anything = true
-	c.categories = []Category{}
+	c.categories = nil
 	c.ranges = []SingleRange{{First: 0, Last: unicode.MaxRune}}
 }
 
 func (c *CharSet) addCategories(cats ...Category) {
+	for _, ct := range cats {
+		c.addCharCategory(newCharCategory(ct))
+	}
+}
+
+func (c *CharSet) addCharCategory(ct charCategory) {
 	// don't add dupes and remove positive+negative
 	if c.anything {
 		// if we've had a previous positive+negative group then
@@ -580,25 +629,16 @@ func (c *CharSet) addCategories(cats ...Category) {
 		return
 	}
 
-	for _, ct := range cats {
-		found := false
-		for _, ct2 := range c.categories {
-			if ct.Cat == ct2.Cat {
-				if ct.Negate != ct2.Negate {
-					// oposite negations...this mean we just
-					// take us as anything and move on
-					c.makeAnything()
-					return
-				}
-				found = true
-				break
+	for _, ct2 := range c.categories {
+		if ct.Cat == ct2.Cat {
+			if ct.Negate != ct2.Negate {
+				// Opposite negations cover the entire character domain.
+				c.makeAnything()
 			}
-		}
-
-		if !found {
-			c.categories = append(c.categories, ct)
+			return
 		}
 	}
+	c.categories = append(c.categories, ct)
 }
 
 // Merges new ranges to our own
@@ -633,13 +673,61 @@ func (c *CharSet) addNegativeRanges(ranges []SingleRange) {
 	c.canonicalize()
 }
 
-func isValidUnicodeCat(catName string) bool {
-	_, ok := unicodeCategories[catName]
-	return ok
+func normalizeUnicodeCategoryAlias(catName string) string {
+	var b strings.Builder
+	b.Grow(len(catName))
+	for _, ch := range catName {
+		switch ch {
+		case '_', '-', ' ':
+			continue
+		default:
+			b.WriteRune(unicode.ToLower(ch))
+		}
+	}
+	return b.String()
+}
+
+func canonicalUnicodeCatName(catName string) (string, bool) {
+	if _, ok := unicodeCategories[catName]; ok {
+		return catName, true
+	}
+
+	normalized := normalizeUnicodeCategoryAlias(catName)
+	if canonical, ok := unicodeSupportedPropertyAliases[normalized]; ok {
+		return canonical, true
+	}
+	if canonical, ok := unicodeBarePropertyValueAliases[normalized]; ok {
+		return canonical, true
+	}
+
+	if eq := strings.IndexRune(catName, '='); eq >= 0 {
+		propName := catName[:eq]
+		valueName := catName[eq+1:]
+		prop, ok := unicodeSupportedPropertyAliases[normalizeUnicodeCategoryAlias(propName)]
+		if !ok {
+			return "", false
+		}
+		values := unicodeSupportedPropertyValueAliases[prop]
+		if values == nil {
+			return "", false
+		}
+		value, ok := values[normalizeUnicodeCategoryAlias(valueName)]
+		if !ok {
+			return "", false
+		}
+		canonical := prop + "=" + value
+		if _, ok := unicodeCategories[canonical]; ok {
+			return canonical, true
+		}
+	}
+
+	return "", false
 }
 
 func (c *CharSet) addCategory(categoryName string, negate, caseInsensitive bool) {
-	if !isValidUnicodeCat(categoryName) {
+	var ok bool
+	categoryName, ok = canonicalUnicodeCatName(categoryName)
+	if !ok {
 		// unknown unicode category, script, or property "blah"
 		panic(fmt.Errorf("unknown unicode category, script, or property '%v'", categoryName))
 
@@ -662,28 +750,19 @@ func (c *CharSet) addCaseEquivalences() {
 	if c.anything {
 		return
 	}
-	for i := 0; i < len(c.ranges); i++ {
+	rangeCount := len(c.ranges)
+	for i := 0; i < rangeCount; i++ {
 		r := c.ranges[i]
-		if r.First == r.Last {
-			equiv := tryFindCaseEquivalences(r.First)
+		// For a single range that's in the set, adds any additional ranges
+		// necessary to ensure that lowercase equivalents are also included.
+		for i := r.First; i <= r.Last; i++ {
+			equiv := tryFindCaseEquivalences(i)
 			for _, eq := range equiv {
-				c.addChar(eq)
+				c.ranges = append(c.ranges, SingleRange{First: eq, Last: eq})
 			}
-		} else {
-			c.addCaseEquivalenceRange(r.First, r.Last)
 		}
 	}
-}
-
-// For a single range that's in the set, adds any additional ranges
-// necessary to ensure that lowercase equivalents are also included.
-func (c *CharSet) addCaseEquivalenceRange(chMin, chMax rune) {
-	for i := chMin; i <= chMax; i++ {
-		equiv := tryFindCaseEquivalences(i)
-		for _, eq := range equiv {
-			c.addChar(eq)
-		}
-	}
+	c.canonicalize()
 }
 
 // Performs a fast lookup which determines if a character is involved in case conversion, as well as
@@ -874,7 +953,7 @@ func (c *CharSet) canonicalize() {
 		} else {
 			c.negate = true
 			c.ranges = []SingleRange{{c.ranges[0].Last + 1, c.ranges[0].Last + 1}}
-			c.categories = []Category{}
+			c.categories = nil
 		}
 	}
 }
@@ -1084,7 +1163,7 @@ func (c *CharSet) addLowercaseRange(chMin, chMax rune) {
 		}
 
 		if chMinT < chMin || chMaxT > chMax {
-			c.addRange(chMinT, chMaxT)
+			c.ranges = append(c.ranges, SingleRange{First: chMinT, Last: chMaxT})
 		}
 	}
 }
@@ -1364,7 +1443,7 @@ func (c *CharSet) GetIfOnlyUnicodeCategories() (cats []Category, negate bool) {
 
 	neg := c.categories[0].Negate
 	for _, cat := range c.categories {
-		if neg != cat.Negate || cat.Cat == SpaceCategoryText || cat.Cat == WordCategoryText {
+		if neg != cat.Negate || cat.Cat == SpaceCategoryText || cat.Cat == WordCategoryText || cat.set != nil {
 			// negate some and not others...a problem
 			// or one of our non-unicode categories
 			return nil, false
@@ -1374,7 +1453,11 @@ func (c *CharSet) GetIfOnlyUnicodeCategories() (cats []Category, negate bool) {
 	// tell the caller to negate if either all the categories
 	// are negated or the set as a whole is negated, but not
 	// both
-	return c.categories, neg != c.negate
+	cats = make([]Category, len(c.categories))
+	for i, cat := range c.categories {
+		cats[i] = cat.Category
+	}
+	return cats, neg != c.negate
 }
 
 type CharClassAnalysisResults struct {

@@ -9,6 +9,7 @@ import (
 	"github.com/grafana/loki/v3/pkg/dataobj"
 	"github.com/grafana/loki/v3/pkg/dataobj/sections/logs"
 	"github.com/grafana/loki/v3/pkg/dataobj/sections/postings"
+	"github.com/grafana/loki/v3/pkg/dataobj/sections/streams"
 )
 
 // created for and scoped to each logs section
@@ -34,8 +35,8 @@ func (c *columnValuesCalculation) Prepare(_ context.Context, calcCtx *logsCalcul
 		}
 		c.columnIndexes[column.Name] = column.ColumnIndex
 		calcCtx.builder.PrepareBloomColumn(
-			calcCtx.tenantID, calcCtx.objectPath, calcCtx.sectionIdx,
-			column.Name, uint(column.Cardinality),
+			calcCtx.objectPath, calcCtx.sectionIdx,
+			column.Name, uint(column.Cardinality), int64(streams.ShardFactor),
 		)
 	}
 	return nil
@@ -54,8 +55,9 @@ func (c *columnValuesCalculation) ProcessBatch(_ context.Context, calcCtx *logsC
 			if _, ok := c.columnIndexes[md.Name]; !ok {
 				return
 			}
-			batchErr = calcCtx.builder.ObserveBloomPosting(calcCtx.tenantID, postings.BloomObservation{
+			batchErr = calcCtx.builder.ObserveBloomPosting(postings.BloomObservation{
 				ObjectPath:       calcCtx.objectPath,
+				ShardBuckets:     int64(streams.ShardFactor),
 				SectionIndex:     calcCtx.sectionIdx,
 				ColumnName:       md.Name,
 				Value:            md.Value,
@@ -71,13 +73,13 @@ func (c *columnValuesCalculation) ProcessBatch(_ context.Context, calcCtx *logsC
 func (c *columnValuesCalculation) Flush(_ context.Context, calcCtx *logsCalculationContext) error {
 	for columnName := range c.columnIndexes {
 		bloomBytes, err := calcCtx.builder.BloomBytes(
-			calcCtx.tenantID, calcCtx.objectPath, calcCtx.sectionIdx, columnName,
+			calcCtx.objectPath, calcCtx.sectionIdx, columnName,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to get bloom bytes for %s: %w", columnName, err)
 		}
 		err = calcCtx.builder.AppendColumnIndex(
-			calcCtx.tenantID, calcCtx.objectPath, calcCtx.sectionIdx,
+			calcCtx.objectPath, calcCtx.sectionIdx,
 			columnName, c.columnIndexes[columnName], bloomBytes,
 		)
 		if err != nil {

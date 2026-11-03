@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,11 +13,12 @@ import (
 
 	"github.com/grafana/loki/v3/integration/client"
 	"github.com/grafana/loki/v3/integration/cluster"
+	"github.com/grafana/loki/v3/pkg/storage/config"
 )
 
 func TestSingleBinaryIngestQuery(t *testing.T) {
 	clu := cluster.New(nil, cluster.SchemaWithTSDB, func(c *cluster.Cluster) {
-		c.SetSchemaVer("v13")
+		c.SetSchemaVer(fmt.Sprintf("v%d", config.LatestSchemaVersion))
 	})
 	defer func() {
 		assert.NoError(t, clu.Cleanup())
@@ -40,9 +42,7 @@ func TestSingleBinaryIngestQuery(t *testing.T) {
 		require.NoError(t, cli.PushLogLine("lineA", cli.Now.Add(-45*time.Minute), nil, map[string]string{"job": "fake"}))
 		require.NoError(t, cli.PushLogLine("lineB", cli.Now.Add(-45*time.Minute), nil, map[string]string{"job": "fake"}))
 
-		// TODO: Flushing is currently causing a panic, as the boltdb shipper is shared using a global variable in:
-		// https://github.com/grafana/loki/blob/66a4692423582ed17cce9bd86b69d55663dc7721/pkg/storage/factory.go#L32-L35
-		// require.NoError(t, cli.Flush())
+		require.NoError(t, cli.Flush())
 	})
 
 	t.Run("ingest-logs-ingester", func(t *testing.T) {

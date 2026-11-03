@@ -137,6 +137,51 @@ func (r *Region) Observations() []AggregatedObservation {
 	return observations
 }
 
+// ObservationForStatistic returns a copy of the aggregated observation the
+// region recorded for stat, or nil if it recorded none. Unlike [Region.Observations]
+// it does not copy the observations of other statistics.
+func (r *Region) ObservationForStatistic(stat Statistic) *AggregatedObservation {
+	if r == nil {
+		return nil
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	agg, ok := r.observations[stat.Key()]
+	if !ok {
+		return nil
+	}
+	observation := *agg
+	return &observation
+}
+
+// MergeObservations folds all observations from src into r using
+// [AggregatedObservation.Merge] semantics.
+func (r *Region) MergeObservations(src *Region) {
+	if r == nil || src == nil {
+		return
+	}
+
+	src.mu.RLock()
+	defer src.mu.RUnlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for key, srcObs := range src.observations {
+		if existing, ok := r.observations[key]; ok {
+			existing.Merge(srcObs)
+		} else {
+			r.observations[key] = &AggregatedObservation{
+				Statistic: srcObs.Statistic,
+				Value:     srcObs.Value,
+				Count:     srcObs.Count,
+			}
+		}
+	}
+}
+
 // End completes the Region. Updates to the Region are ignored after
 // calling End.
 func (r *Region) End() {

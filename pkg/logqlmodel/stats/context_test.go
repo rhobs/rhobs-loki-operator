@@ -2,6 +2,7 @@ package stats
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ func TestResult(t *testing.T) {
 	stats.SetQueryReferencedStructuredMetadata()
 	stats.AddPipelineWrapperFilterdLines(1)
 	stats.AddWireBytesTransferred(42)
+	stats.AddChunkFetchFailures(5)
 
 	fakeIngesterQuery(ctx)
 	fakeIngesterQuery(ctx)
@@ -59,6 +61,7 @@ func TestResult(t *testing.T) {
 				ChunksDownloadTime:           time.Second.Nanoseconds(),
 				QueryReferencedStructured:    true,
 				PipelineWrapperFilteredLines: 1,
+				ChunkFetchFailures:           5,
 				Chunk: Chunk{
 					HeadChunkBytes:    10,
 					HeadChunkLines:    20,
@@ -199,6 +202,7 @@ func TestResult_Merge(t *testing.T) {
 				ChunksDownloadTime:           time.Second.Nanoseconds(),
 				QueryReferencedStructured:    true,
 				PipelineWrapperFilteredLines: 2,
+				ChunkFetchFailures:           3,
 				Chunk: Chunk{
 					HeadChunkBytes:    10,
 					HeadChunkLines:    20,
@@ -264,6 +268,7 @@ func TestResult_Merge(t *testing.T) {
 				ChunksDownloadTime:           2 * time.Second.Nanoseconds(),
 				QueryReferencedStructured:    true,
 				PipelineWrapperFilteredLines: 4,
+				ChunkFetchFailures:           2 * 3,
 				Chunk: Chunk{
 					HeadChunkBytes:    2 * 10,
 					HeadChunkLines:    2 * 20,
@@ -360,6 +365,63 @@ func TestSummaryMerge_EstimatedQueryBytesUsesMax(t *testing.T) {
 	require.Equal(t, int64(2048), s.EstimatedQueryBytes)
 }
 
+func TestContext_RecordDataobjSectionsResolutionTime(t *testing.T) {
+	resolutionTime := func(statsCtx *Context) time.Duration {
+		return statsCtx.Result(0, 0, 0).DataobjSectionsResolutionMaxTime()
+	}
+
+	t.Run("it keeps the largest time it has seen", func(t *testing.T) {
+		statsCtx, _ := NewContext(context.Background())
+
+		statsCtx.RecordDataobjSectionsResolutionTime(5 * time.Millisecond)
+		statsCtx.RecordDataobjSectionsResolutionTime(9 * time.Millisecond)
+		statsCtx.RecordDataobjSectionsResolutionTime(2 * time.Millisecond)
+
+		require.Equal(t, 9*time.Millisecond, resolutionTime(statsCtx))
+	})
+
+	t.Run("it keeps the largest time when many goroutines record at once", func(t *testing.T) {
+		statsCtx, _ := NewContext(context.Background())
+
+		var wg sync.WaitGroup
+		for i := 1; i <= 100; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				statsCtx.RecordDataobjSectionsResolutionTime(time.Duration(i) * time.Millisecond)
+			}()
+		}
+		wg.Wait()
+
+		require.Equal(t, 100*time.Millisecond, resolutionTime(statsCtx))
+	})
+
+	t.Run("it reports zero when no section was resolved", func(t *testing.T) {
+		statsCtx, _ := NewContext(context.Background())
+		require.Zero(t, resolutionTime(statsCtx))
+	})
+}
+
+func TestResultMerge_DataobjSectionsResolutionMaxTime(t *testing.T) {
+	resultWith := func(d time.Duration) Result {
+		return Result{Querier: Querier{Store: Store{Dataobj: Dataobj{SectionsResolutionMaxTime: int64(d)}}}}
+	}
+
+	t.Run("it keeps the larger of the two times instead of adding them", func(t *testing.T) {
+		merged := resultWith(5 * time.Millisecond)
+		merged.Merge(resultWith(8 * time.Millisecond))
+
+		require.Equal(t, 8*time.Millisecond, merged.DataobjSectionsResolutionMaxTime())
+	})
+
+	t.Run("a smaller merged time does not lower the larger one", func(t *testing.T) {
+		merged := resultWith(8 * time.Millisecond)
+		merged.Merge(resultWith(2 * time.Millisecond))
+
+		require.Equal(t, 8*time.Millisecond, merged.DataobjSectionsResolutionMaxTime())
+	})
+}
+
 func TestReset(t *testing.T) {
 	statsCtx, ctx := NewContext(context.Background())
 	fakeIngesterQuery(ctx)
@@ -369,6 +431,14 @@ func TestReset(t *testing.T) {
 	res = statsCtx.Result(0, 0, 0)
 	res.Summary.Subqueries = 0
 	require.Empty(t, res)
+}
+
+func TestTotalChunkFetchFailures(t *testing.T) {
+	r := Result{
+		Querier:  Querier{Store: Store{ChunkFetchFailures: 3}},
+		Ingester: Ingester{Store: Store{ChunkFetchFailures: 2}},
+	}
+	require.Equal(t, int64(5), r.TotalChunkFetchFailures())
 }
 
 func TestIngester(t *testing.T) {

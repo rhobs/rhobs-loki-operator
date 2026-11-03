@@ -20,12 +20,6 @@ import (
 // that the recovered node deep-equals the input. This catches "added a struct
 // field but forgot to copy it in marshal_node.go / unmarshal_node.go" silent
 // bugs without requiring the test author to enumerate every field.
-//
-// TODO: physical.LogMerge is omitted because it has no proto representation:
-// the type switches in marshal_node.go and unmarshal_node.go don't include it,
-// so any plan containing it errors out at serialization time. Adding it
-// here would surface that gap, but as a separate finding from this test's
-// "fields not copied" focus. Once proto support lands, add it to the list.
 func TestRoundTripNodes_Reflection(t *testing.T) {
 	cases := []physical.Node{
 		new(physical.Batching),
@@ -33,6 +27,7 @@ func TestRoundTripNodes_Reflection(t *testing.T) {
 		new(physical.ColumnCompat),
 		new(physical.DataObjScan),
 		new(physical.Filter),
+		new(physical.IndexFilter),
 		new(physical.IndexMerge),
 		new(physical.Join),
 		new(physical.Limit),
@@ -42,6 +37,7 @@ func TestRoundTripNodes_Reflection(t *testing.T) {
 		new(physical.Projection),
 		new(physical.RangeAggregation),
 		new(physical.ScanSet),
+		new(physical.SortObject),
 		new(physical.TopK),
 		new(physical.VectorAggregation),
 		//new(physical.LogMerge),
@@ -125,4 +121,17 @@ func newPhysicalFiller() *testutils.Filler {
 	})
 
 	return f
+}
+
+func TestSortObjectMarshalPhysicalIsDeepCopy(t *testing.T) {
+	original := &physicalpb.SortObject{
+		SourceObjectPath: "objects/aa/bb",
+		SortSchema:       []string{"label:app"},
+	}
+
+	marshaled, err := original.MarshalPhysical(ulid.Make())
+	require.NoError(t, err)
+	marshaled.(*physical.SortObject).SortSchema[0] = "label:cluster"
+
+	require.Equal(t, "label:app", original.SortSchema[0])
 }

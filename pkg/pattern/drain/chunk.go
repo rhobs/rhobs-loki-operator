@@ -22,7 +22,7 @@ type Chunk struct {
 
 func newChunk(ts model.Time, maxChunkAge time.Duration, sampleInterval time.Duration) Chunk {
 	maxSize := int(maxChunkAge.Nanoseconds()/sampleInterval.Nanoseconds()) + 1
-	v := Chunk{Samples: make([]logproto.PatternSample, 1, maxSize)}
+	v := Chunk{Samples: make([]logproto.PatternSample, 1, maxSize/8)} // Allocate 1/8 total size so sparse chunks don't waste memory
 	v.Samples[0] = logproto.PatternSample{
 		Timestamp: ts,
 		Value:     1,
@@ -134,7 +134,7 @@ func (c Chunks) Iterator(pattern, lvl string, from, through, step, sampleInterva
 		}
 		iters = append(iters, iter.NewSlice(pattern, lvl, samples))
 	}
-	return iter.NewNonOverlappingIterator(pattern, lvl, iters)
+	return iter.NewChainedIterator(pattern, lvl, iters)
 }
 
 func (c Chunks) samples() []*logproto.PatternSample {

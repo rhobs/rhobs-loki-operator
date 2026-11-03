@@ -105,8 +105,11 @@ func (b *Builder) EstimatedSize() int {
 	// End timestamp column (int64 with delta encoding)
 	sizeEstimate += len(b.indexPointers) * timestampDeltaSize
 
-	// Column metadata overhead (3 columns)
-	sizeEstimate += 3 * metadataOverhead
+	// File size and uncompressed logs size columns (int64)
+	sizeEstimate += 2 * len(b.indexPointers) * 8
+
+	// Column metadata overhead (5 columns)
+	sizeEstimate += 5 * metadataOverhead
 
 	return sizeEstimate
 }

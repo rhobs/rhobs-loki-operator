@@ -132,7 +132,7 @@ func NewRuleStore(ctx context.Context, cfg rulestore.Config, cfgProvider bucket.
 		return local.NewLocalRulesClient(cfg.Local, loader)
 	}
 
-	bucketClient, err := bucket.NewClient(ctx, cfg.Backend, cfg.Config, "ruler-storage", logger)
+	bucketClient, err := bucket.NewClient(ctx, cfg.Backend, cfg.Config, "ruler-storage", logger, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +149,7 @@ type defaultFileLoader struct {
 }
 
 func newDefaultFileLoader() defaultFileLoader {
+	//nolint:forbidigo // stores a real PromQL parser for rule-file loading
 	return defaultFileLoader{
 		p:        parser.NewParser(parser.Options{}),
 		parseLog: slog.New(slog.NewTextHandler(io.Discard, nil)),

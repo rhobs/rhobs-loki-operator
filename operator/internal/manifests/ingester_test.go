@@ -187,6 +187,24 @@ func TestNewIngesterStatefulSet_TopologySpreadConstraints(t *testing.T) {
 	}, ss.Spec.Template.Spec.TopologySpreadConstraints)
 }
 
+func TestNewIngesterStatefulSet_TerminationGracePeriodSeconds(t *testing.T) {
+	ss := NewIngesterStatefulSet(Options{
+		Name:      "abcd",
+		Namespace: "efgh",
+		Stack: lokiv1.LokiStackSpec{
+			StorageClassName: "standard",
+			Template: &lokiv1.LokiTemplateSpec{
+				Ingester: &lokiv1.LokiComponentSpec{
+					Replicas: 1,
+				},
+			},
+		},
+	})
+
+	require.NotNil(t, ss.Spec.Template.Spec.TerminationGracePeriodSeconds)
+	require.Equal(t, defaultIngesterTerminationGracePeriodSeconds, *ss.Spec.Template.Spec.TerminationGracePeriodSeconds)
+}
+
 func TestNewIngesterStatefulSet_TerminationGracePeriod(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -196,7 +214,7 @@ func TestNewIngesterStatefulSet_TerminationGracePeriod(t *testing.T) {
 		{
 			name:                "default - no debug options",
 			debugOptions:        nil,
-			expectedGracePeriod: nil,
+			expectedGracePeriod: &[]int64{defaultIngesterTerminationGracePeriodSeconds}[0],
 		},
 		{
 			name: "custom termination grace period",

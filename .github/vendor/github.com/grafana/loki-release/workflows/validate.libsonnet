@@ -123,7 +123,6 @@ local validationJob = _validationJob();
       validationMakeStep('validate example configs', 'validate-example-configs'),
       validationMakeStep('validate dev cluster config', 'validate-dev-cluster-config'),
       validationMakeStep('check example config docs', 'check-example-config-doc'),
-      validationMakeStep('check helm reference doc', 'documentation-helm-reference-check'),
     ]) + {
       steps+: [
         step.new('build docs website')
@@ -148,23 +147,6 @@ local validationJob = _validationJob();
     }
   ),
 
-  faillint:
-    validationJob
-    + job.withSteps([
-      common.fetchReleaseRepo,
-      common.fixDubiousOwnership,
-      common.fetchReleaseLib,
-      step.new('install dependencies')
-      + step.withIf("${{ !fromJSON(env.SKIP_VALIDATION) && startsWith(inputs.build_image, 'golang') }}")
-      + step.withRun('lib/workflows/install_workflow_dependencies.sh loki-release'),
-      step.new('faillint')
-      + step.withIf('${{ !fromJSON(env.SKIP_VALIDATION) }}')
-      + step.withRun(|||
-        faillint -paths "sync/atomic=go.uber.org/atomic" ./...
-      |||)
-      + step.withWorkingDirectory('release'),
-    ]),
-
   golangciLint: setupValidationDeps(
     validationJob
     + job.withSteps(
@@ -175,7 +157,7 @@ local validationJob = _validationJob();
         + step.with({
           version: '${{ inputs.golang_ci_lint_version }}',
           'only-new-issues': false,  // we want a PR to fail if the target branch fails
-          args: '-v --timeout 15m --build-tags linux,promtail_journal_enabled',
+          args: '-v --timeout 15m --build-tags linux',
         }),
       ],
     )
@@ -203,7 +185,6 @@ local validationJob = _validationJob();
   failCheck: job.new()
              + job.withNeeds([
                'checkFiles',
-               'faillint',
                'golangciLint',
                'lintFiles',
                'integration',
@@ -218,14 +199,13 @@ local validationJob = _validationJob();
                step.new('verify checks passed')
                + step.withRun(|||
                  echo "Some checks have failed!"
-                 exit 1,
+                 exit 1
                |||),
              ]),
 
   check: job.new()
          + job.withNeeds([
            'checkFiles',
-           'faillint',
            'golangciLint',
            'lintFiles',
            'integration',

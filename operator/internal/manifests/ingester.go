@@ -313,7 +313,7 @@ func newIngesterPodDisruptionBudget(opts Options) *policyv1.PodDisruptionBudget 
 
 func ingesterTerminationGracePeriod(debug *lokiv1.DebugOptionsSpec) *int64 {
 	if debug == nil || debug.IngesterTerminationGracePeriodSeconds == nil {
-		return nil
+		return ptr.To(defaultIngesterTerminationGracePeriodSeconds)
 	}
 	return debug.IngesterTerminationGracePeriodSeconds
 }

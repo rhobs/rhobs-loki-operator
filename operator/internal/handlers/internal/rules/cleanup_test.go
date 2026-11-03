@@ -32,7 +32,7 @@ var (
 		Data: map[string][]byte{
 			"endpoint":          []byte("s3://your-endpoint"),
 			"region":            []byte("a-region"),
-			"bucketnames":       []byte("bucket1,bucket2"),
+			"bucketnames":       []byte("loki-data"),
 			"access_key_id":     []byte("a-secret-id"),
 			"access_key_secret": []byte("a-secret-key"),
 		},
@@ -95,7 +95,7 @@ func TestCleanup_RemovesRulerResourcesWhenDisabled(t *testing.T) {
 			Storage: lokiv1.ObjectStorageSpec{
 				Schemas: []lokiv1.ObjectStorageSchema{
 					{
-						Version:       lokiv1.ObjectStorageSchemaV11,
+						Version:       lokiv1.ObjectStorageSchemaV13,
 						EffectiveDate: "2020-10-11",
 					},
 				},

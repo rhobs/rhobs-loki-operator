@@ -69,25 +69,26 @@ func tryFindFirstCharClass(node *RegexNode, ccIn **CharSet) int {
 	case NtNotone, NtNotoneloop, NtNotonelazy, NtNotoneloopatomic:
 		if cc == nil {
 			cc = &CharSet{}
-			*ccIn = cc
-		}
-		if cc.IsMergeable() {
 			cc.addChar(node.Ch)
 			cc.negate = true
-			/*if node.Ch > 0 {
-				// Add the range before the excluded char.
-				cc.addRange(0, (node.Ch - 1))
+			*ccIn = cc
+		} else if cc.IsMergeable() {
+			// Union the complement ranges with the accumulated characters
+			// before canonicalizing; negating the accumulator would exclude them.
+			if node.Ch > 0 {
+				cc.ranges = append(cc.ranges, SingleRange{0, node.Ch - 1})
 			}
 			if node.Ch < unicode.MaxRune {
-				// Add the range after the excluded char.
-				cc.addRange(node.Ch+1, unicode.MaxRune)
-			}*/
-			if node.T == NtNotone || node.M > 0 {
-				return 1
+				cc.ranges = append(cc.ranges, SingleRange{node.Ch + 1, unicode.MaxRune})
 			}
-			return -1
+			cc.canonicalize()
+		} else {
+			return 0
 		}
-		return 0
+		if node.T == NtNotone || node.M > 0 {
+			return 1
+		}
+		return -1
 
 	case NtSet, NtSetloop, NtSetlazy, NtSetloopatomic:
 		{
@@ -123,9 +124,14 @@ func tryFindFirstCharClass(node *RegexNode, ccIn **CharSet) int {
 		}
 		return 0
 
+	case NtGrapheme:
+		// Every rune can begin a grapheme, so there is no useful candidate
+		// restriction to derive.
+		return 0
+
 	// Zero-width elements.  These don't contribute to the starting set, so return null to indicate a caller
 	// should keep looking past them.
-	case NtEmpty, NtNothing, NtBol, NtEol, NtBoundary, NtNonboundary, NtECMABoundary, NtNonECMABoundary,
+	case NtEmpty, NtResetCapture, NtNothing, NtBol, NtEol, NtBoundary, NtNonboundary, NtECMABoundary, NtNonECMABoundary,
 		NtBeginning, NtStart, NtEndZ, NtEnd, NtUpdateBumpalong, NtPosLook, NtNegLook:
 		return -1
 
@@ -532,6 +538,9 @@ func findPrefixesCore(node *RegexNode, res *[]*bytes.Buffer, ignoreCase bool) bo
 		// that comprise the set. For case-insensitive, we need the set to be two ASCII letters that case fold to the same thing.
 		// As with One and loops, set loops are handled the same as sets up to the min iteration limit.
 		case NtSet, NtSetloop, NtSetlazy, NtSetloopatomic:
+			if node.Set == nil || node.Set.IsNegated() {
+				return false
+			}
 
 			setChars := node.Set.GetSetChars(maxPrefixes)
 
@@ -829,7 +838,7 @@ func tryFindRawFixedSets(node *RegexNode, res *[]FixedDistanceSet, distance *int
 			*distance += node.M
 			return true
 		}
-	case NtBeginning, NtBol, NtBoundary, NtECMABoundary, NtEmpty, NtEnd, NtEndZ, NtEol,
+	case NtBeginning, NtBol, NtBoundary, NtECMABoundary, NtEmpty, NtResetCapture, NtEnd, NtEndZ, NtEol,
 		NtNonboundary, NtNonECMABoundary, NtUpdateBumpalong,
 		NtStart, NtNegLook, NtPosLook:
 		// Zero-width anchors and assertions.  In theory, for PositiveLookaround and NegativeLookaround we could also
@@ -895,10 +904,11 @@ func tryFindRawFixedSets(node *RegexNode, res *[]FixedDistanceSet, distance *int
 							combined[fixedSet.Distance] = v
 						}
 					} else {
+						setCopy := fixedSet.Set.Copy()
 						combined[fixedSet.Distance] = struct {
 							Set   *CharSet
 							Count int
-						}{Set: fixedSet.Set, Count: 1}
+						}{Set: &setCopy, Count: 1}
 					}
 				}
 			}
@@ -1034,50 +1044,6 @@ func sumFrequencies(chars []rune) float32 {
 	return sum
 }
 
-func hasHighFrequencyChars(set FixedDistanceSet) bool {
-	if set.Negated {
-		return true
-	}
-
-	// Sets without extracted chars can't be frequency-analyzed.
-	// Single-char sets use IndexOf, which is a strong filter regardless of frequency.
-	if len(set.Chars) <= 1 {
-		return false
-	}
-
-	totalFrequency := sumFrequencies(set.Chars)
-
-	// If the average frequency of the set's chars exceeds this threshold, the
-	// characters are common enough that a multi-string search may be a better filter.
-	const highFrequencyThreshold = 0.6
-	return totalFrequency >= highFrequencyThreshold*float32(len(set.Chars))
-}
-
-func mayContainCaseInsensitiveMatching(node *RegexNode) bool {
-	if node.Options&IgnoreCase != 0 {
-		return true
-	}
-
-	if node.Set != nil {
-		chars := node.Set.GetSetChars(maxPrefixes)
-		for _, ch := range chars {
-			if participatesInCaseConversion(ch) &&
-				slices.Contains(chars, unicode.ToLower(ch)) &&
-				slices.Contains(chars, unicode.ToUpper(ch)) {
-				return true
-			}
-		}
-	}
-
-	for _, child := range node.Children {
-		if mayContainCaseInsensitiveMatching(child) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // Percent occurrences in source text (100 * char count / total count)
 var frequency = []float32{
 	0.000 /* '\x00' */, 0.000 /* '\x01' */, 0.000 /* '\x02' */, 0.000 /* '\x03' */, 0.000 /* '\x04' */, 0.000 /* '\x05' */, 0.000 /* '\x06' */, 0.000, /* '\x07' */
@@ -1184,6 +1150,10 @@ func findLiteralFollowingLeadingLoop(node *RegexNode) *LiteralAfterLoop {
 		}
 		nextChild = node.Children[2]
 	}
+	nextChild = unwrapImmediateLiteralAfterLoopNode(nextChild)
+	if nextChild == nil {
+		return nil
+	}
 
 	// Is the set loop followed by a case-sensitive string we can search for?
 	if prefix := findPrefix(nextChild); len(prefix) >= 1 {
@@ -1230,16 +1200,6 @@ func findLiteralFollowingLeadingLoop(node *RegexNode) *LiteralAfterLoop {
 		}
 	}
 
-	// Is the set loop followed by a set we can search for? Whereas the above helpers will drill down into
-	// children as is appropriate, to examine a set here, we need to drill in ourselves. We can drill through
-	// atomic and capture nodes, as they don't affect flow control, and into the left-most node of a concatenate,
-	// as the first child is guaranteed next. We can also drill into a loop or lazy loop that has a guaranteed
-	// iteration, for the same reason as with concatenate.
-	for nextChild.T == NtAtomic || nextChild.T == NtCapture || nextChild.T == NtConcatenate ||
-		(nextChild.T == NtLoop || nextChild.T == NtLazyloop && nextChild.M >= 1) {
-		nextChild = nextChild.Children[0]
-	}
-
 	// If the resulting node is a set with at least one iteration, we can search for it.
 	if nextChild.IsSetFamily() &&
 		!nextChild.Set.IsNegated() &&
@@ -1264,6 +1224,22 @@ func findLiteralFollowingLeadingLoop(node *RegexNode) *LiteralAfterLoop {
 	return nil
 }
 
+func unwrapImmediateLiteralAfterLoopNode(node *RegexNode) *RegexNode {
+	for {
+		node = unwrapTransparentNodes(node)
+		if node == nil {
+			return nil
+		}
+		if node.T != NtConcatenate {
+			return node
+		}
+		if len(node.Children) == 0 {
+			return nil
+		}
+		node = node.Children[0]
+	}
+}
+
 func findRequiredLandmarkChain(node *RegexNode) *RequiredLandmarkChain {
 	if (node.Options & RightToLeft) != 0 {
 		return nil
@@ -1286,6 +1262,8 @@ func findRequiredLandmarkChain(node *RegexNode) *RequiredLandmarkChain {
 	for _, child := range node.Children[1:] {
 		if landmark, ok := extractRequiredLandmark(child); ok {
 			landmarks = append(landmarks, landmark)
+		} else if len(landmarks) == 0 && !isZeroWidthLandmarkGap(child) {
+			return nil
 		}
 	}
 	if len(landmarks) < 2 {
@@ -1295,6 +1273,21 @@ func findRequiredLandmarkChain(node *RegexNode) *RequiredLandmarkChain {
 	return &RequiredLandmarkChain{
 		LeadingLoopSet: firstChild.Set,
 		Landmarks:      landmarks,
+	}
+}
+
+func isZeroWidthLandmarkGap(node *RegexNode) bool {
+	node = unwrapTransparentNodes(node)
+	if node == nil {
+		return true
+	}
+	switch node.T {
+	case NtEmpty, NtResetCapture, NtUpdateBumpalong,
+		NtBeginning, NtBol, NtStart, NtEndZ, NtEnd, NtEol,
+		NtBoundary, NtNonboundary, NtECMABoundary, NtNonECMABoundary:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1352,7 +1345,7 @@ func extractRequiredLandmarkAlternative(node *RegexNode) (RequiredLandmarkAltern
 	i := 0
 	if i < len(children) {
 		if whitespaceSet, min, ok := whitespaceLoop(children[i]); ok {
-			alt.WhitespaceSet = whitespaceSet
+			alt.LeadingWhitespaceSet = whitespaceSet
 			alt.RequireWhitespaceBefore = min > 0
 			i++
 		}
@@ -1367,11 +1360,11 @@ func extractRequiredLandmarkAlternative(node *RegexNode) (RequiredLandmarkAltern
 	core := unwrapTransparentNodes(children[i])
 	switch core.T {
 	case NtOne:
-		alt.Literal = string(core.Ch)
+		alt.Literal = []rune{core.Ch}
 		alt.MinRepeat = 1
 		alt.MaxRepeat = 1
 	case NtMulti:
-		alt.Literal = string(core.Str)
+		alt.Literal = core.Str
 		alt.MinRepeat = 1
 		alt.MaxRepeat = 1
 	case NtSet, NtSetloop, NtSetloopatomic, NtSetlazy:
@@ -1392,7 +1385,6 @@ func extractRequiredLandmarkAlternative(node *RegexNode) (RequiredLandmarkAltern
 			return RequiredLandmarkAlternative{}, false
 		}
 		alt.Set = core.Set
-		alt.Chars = chars
 	default:
 		return RequiredLandmarkAlternative{}, false
 	}
@@ -1400,9 +1392,7 @@ func extractRequiredLandmarkAlternative(node *RegexNode) (RequiredLandmarkAltern
 
 	if i < len(children) {
 		if whitespaceSet, min, ok := whitespaceLoop(children[i]); ok {
-			if alt.WhitespaceSet == nil {
-				alt.WhitespaceSet = whitespaceSet
-			}
+			alt.TrailingWhitespaceSet = whitespaceSet
 			alt.RequireWhitespaceAfter = min > 0
 			i++
 		}

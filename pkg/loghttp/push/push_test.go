@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,7 +73,12 @@ func marshalProto(m proto.Message) []byte {
 }
 
 func TestParseRequest(t *testing.T) {
-	var previousBytesReceived, previousStructuredMetadataBytesReceived, previousLinesReceived int
+	// These are process-wide analytics counters that other tests in this package may have already
+	// incremented; capture the current values as the baseline so the per-iteration deltas below are
+	// correct regardless of test execution order.
+	previousBytesReceived := int(bytesReceivedStats.Value()["total"].(int64))
+	previousStructuredMetadataBytesReceived := int(structuredMetadataBytesReceivedStats.Value()["total"].(int64))
+	previousLinesReceived := int(linesReceivedStats.Value()["total"].(int64))
 	for index, test := range []struct {
 		path                            string
 		body                            string
@@ -357,6 +363,7 @@ func TestParseRequest(t *testing.T) {
 
 			structuredMetadataBytesIngested.Reset()
 			bytesIngested.Reset()
+			expandedBytesIngested.Reset()
 			linesIngested.Reset()
 			if test.fakeLimits == nil {
 				test.fakeLimits = &fakeLimits{enabled: test.enableServiceDiscovery}
@@ -475,6 +482,15 @@ func TestParseRequest(t *testing.T) {
 					expectedStreamLabelsSize += len(lbs.String())
 				}
 				require.EqualValues(t, expectedStreamLabelsSize, stats.StreamLabelsSize)
+
+				// For non-OTLP (Loki) requests, TotalExpandedEntriesSize should equal the combined size of
+				// log lines and structured metadata bytes, since there are no resource/scope attributes to expand.
+				require.EqualValues(t, totalBytes, stats.TotalExpandedEntriesSize)
+				require.Equal(
+					t,
+					float64(totalBytes),
+					testutil.ToFloat64(expandedBytesIngested.WithLabelValues("fake", "loki")),
+				)
 			} else {
 				assert.Errorf(t, err, "Should give error for %d", index)
 				assert.Nil(t, data, "Should not give data for %d", index)
@@ -485,6 +501,7 @@ func TestParseRequest(t *testing.T) {
 				require.Equal(t, float64(0), testutil.ToFloat64(structuredMetadataBytesIngested.WithLabelValues("fake", "1" /* We use "1" here because fakeLimits.RetentionHoursFor returns "1" */, fmt.Sprintf("%t", test.aggregatedMetric), policy, "loki")))
 				require.Equal(t, float64(0), testutil.ToFloat64(bytesIngested.WithLabelValues("fake", "1" /* We use "1" here because fakeLimits.RetentionHoursFor returns "1" */, fmt.Sprintf("%t", test.aggregatedMetric), policy, "loki")))
 				require.Equal(t, float64(0), testutil.ToFloat64(linesIngested.WithLabelValues("fake", fmt.Sprintf("%t", test.aggregatedMetric), policy, "loki")))
+				require.Equal(t, float64(0), testutil.ToFloat64(expandedBytesIngested.WithLabelValues("fake", "loki")))
 			}
 		})
 	}
@@ -538,7 +555,7 @@ func Test_ServiceDetection(t *testing.T) {
 
 		limits := &fakeLimits{enabled: true}
 		streamResolver := newMockStreamResolver("fake", limits)
-		data, _, err := ParseRequest(util_log.Logger, "fake", 100<<20, 100<<20, request, limits, nil, ParseOTLPRequest, tracker, streamResolver, "", "loki")
+		data, _, err := ParseRequest(util_log.Logger, "fake", 100<<20, 100<<20, request, limits, nil, NewOTLPRequestParser(false), tracker, streamResolver, "", "loki")
 		require.NoError(t, err)
 		require.Equal(t, labels.FromStrings("k8s_job_name", "bar", LabelServiceName, "bar").String(), data.Streams[0].Labels)
 	})
@@ -553,7 +570,7 @@ func Test_ServiceDetection(t *testing.T) {
 			indexAttributes: []string{"special"},
 		}
 		streamResolver := newMockStreamResolver("fake", limits)
-		data, _, err := ParseRequest(util_log.Logger, "fake", 100<<20, 100<<20, request, limits, nil, ParseOTLPRequest, tracker, streamResolver, "", "loki")
+		data, _, err := ParseRequest(util_log.Logger, "fake", 100<<20, 100<<20, request, limits, nil, NewOTLPRequestParser(false), tracker, streamResolver, "", "loki")
 		require.NoError(t, err)
 		require.Equal(t, labels.FromStrings("special", "sauce", LabelServiceName, "sauce").String(), data.Streams[0].Labels)
 	})
@@ -568,7 +585,7 @@ func Test_ServiceDetection(t *testing.T) {
 			indexAttributes: []string{},
 		}
 		streamResolver := newMockStreamResolver("fake", limits)
-		data, _, err := ParseRequest(util_log.Logger, "fake", 100<<20, 100<<20, request, limits, nil, ParseOTLPRequest, tracker, streamResolver, "", "loki")
+		data, _, err := ParseRequest(util_log.Logger, "fake", 100<<20, 100<<20, request, limits, nil, NewOTLPRequestParser(false), tracker, streamResolver, "", "loki")
 		require.NoError(t, err)
 		require.Equal(t, labels.FromStrings(LabelServiceName, ServiceUnknown).String(), data.Streams[0].Labels)
 	})
@@ -670,7 +687,7 @@ func TestNegativeSizeHandling(t *testing.T) {
 	linesIngested.Reset()
 
 	// Create a custom request parser that will generate negative sizes
-	var mockParser RequestParser = func(_ string, _ *http.Request, _ Limits, _ *runtime.TenantConfigs, _ int, _ int64, _ UsageTracker, _ StreamResolver, _ kitlog.Logger) (*logproto.PushRequest, *Stats, error) {
+	var mockParser RequestParser = func(_ string, _ *http.Request, _ Limits, _ *runtime.TenantConfigs, _ int, _ int64, _ UsageTracker, _ StreamResolver, _ kitlog.Logger) (*logproto.InternalPushRequest, *Stats, error) {
 		// Create a minimal valid request
 		req := &logproto.PushRequest{
 			Streams: []logproto.Stream{
@@ -698,7 +715,7 @@ func TestNegativeSizeHandling(t *testing.T) {
 		stats.StructuredMetadataBytes[policy] = make(map[time.Duration]int64)
 		stats.StructuredMetadataBytes[policy][retention] = -200
 
-		return req, stats, nil
+		return logproto.FromPushRequest(req), stats, nil
 	}
 
 	// Create a mock request
@@ -902,6 +919,10 @@ func (f *fakeLimits) DiscoverServiceName(_ string) []string {
 	}
 }
 
+func (f *fakeLimits) MaxPushSize(_ string) int {
+	return math.MaxInt32
+}
+
 type mockStreamResolver struct {
 	tenant string
 	limits *fakeLimits
@@ -963,7 +984,7 @@ func (t *MockCustomTracker) ReceivedBytesAdd(_ context.Context, _ string, _ time
 }
 
 // TestRequestParser_StreamLabelsExceed16MB tests that both ParseLokiRequest and
-// ParseOTLPRequest reject streams where the total labels string per streamexceeds 16MB
+// the OTLP parser reject streams where the total labels string per streamexceeds 16MB
 // with ErrRequestBodyTooLarge.
 func TestRequestParser_StreamLabelsExceed16MB(t *testing.T) {
 	const testMaxLabelSize = 1 << 24 // 16MB
@@ -1050,7 +1071,7 @@ func TestRequestParser_StreamLabelsExceed16MB(t *testing.T) {
 		})
 	})
 
-	t.Run("ParseOTLPRequest", func(t *testing.T) {
+	t.Run("OTLP", func(t *testing.T) {
 		t.Run("single_resource_attribute_over_16MB", func(t *testing.T) {
 			longValue := strings.Repeat("a", testMaxLabelSize+1)
 
@@ -1066,7 +1087,7 @@ func TestRequestParser_StreamLabelsExceed16MB(t *testing.T) {
 
 			request := httptest.NewRequest("POST", "/otlp/v1/push", bytes.NewReader(body))
 			request.Header.Add("Content-Type", "application/json")
-			runParserTest(t, ParseOTLPRequest, request, nil, ErrRequestBodyTooLarge)
+			runParserTest(t, NewOTLPRequestParser(false), request, nil, ErrRequestBodyTooLarge)
 		})
 
 		t.Run("multiple_resource_logs_each_under_16MB_is_ok", func(t *testing.T) {
@@ -1093,7 +1114,7 @@ func TestRequestParser_StreamLabelsExceed16MB(t *testing.T) {
 			limits := &fakeLimits{indexAttributes: []string{"label1"}}
 			request := httptest.NewRequest("POST", "/otlp/v1/push", bytes.NewReader(body))
 			request.Header.Add("Content-Type", "application/json")
-			runParserTest(t, ParseOTLPRequest, request, limits, nil)
+			runParserTest(t, NewOTLPRequestParser(false), request, limits, nil)
 		})
 	})
 }

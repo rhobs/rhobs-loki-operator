@@ -21,8 +21,10 @@ import (
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/logql"
 	lokilog "github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
 	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 	"github.com/grafana/loki/v3/pkg/querier/astmapper"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
 	"github.com/grafana/loki/v3/pkg/storage/chunk"
 	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
 	"github.com/grafana/loki/v3/pkg/storage/chunk/client"
@@ -71,6 +73,27 @@ type Store interface {
 	SelectStore
 	SchemaConfigProvider
 	Instrumentable
+	index.Flusher
+}
+
+// syncerFlusher is the union of the index store's optional on-demand
+// capabilities: flushing the in-memory head to object storage (write side, used
+// by the ingester) and refreshing the object-listing cache + downloading newly
+// shipped indexes (read side, used by the index-gateway). The TSDB store -- the
+// only store implementing either -- implements both, so LokiStore collects them
+// through this single interface (see storeForPeriod). The public index.Flusher
+// and index.Syncer stay separate so write-only and read-only consumers each
+// depend only on the capability they use.
+type syncerFlusher interface {
+	index.Flusher
+	index.Syncer
+}
+
+// namedSyncerFlusher pairs a collected per-period store with its store name, so
+// SyncStatuses can label each index's status.
+type namedSyncerFlusher struct {
+	name string
+	syncerFlusher
 }
 
 type LokiStore struct {
@@ -97,6 +120,12 @@ type LokiStore struct {
 	congestionControllerFactory func(cfg congestion.Config, logger log.Logger, metrics *congestion.Metrics) congestion.Controller
 
 	metricsNamespace string
+
+	// syncerFlushers are the per-period TSDB index stores collected at
+	// construction, used to force the in-memory head to object storage
+	// (FlushIndexes) and to refresh the object-listing cache + download newly
+	// shipped indexes on demand (TriggerSync/SyncStatuses).
+	syncerFlushers []namedSyncerFlusher
 }
 
 // NewStore creates a new Loki Store using configuration supplied.
@@ -165,13 +194,48 @@ func NewStore(cfg Config, storeCfg config.ChunkStoreConfig, schemaCfg config.Sch
 	return s, nil
 }
 
+// FlushIndexes forces every writable index store collected at construction to
+// build and ship its in-memory indexes (the TSDB head) to object storage.
+func (s *LokiStore) FlushIndexes(ctx context.Context) error {
+	for _, sf := range s.syncerFlushers {
+		if err := sf.FlushIndexes(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TriggerSync starts a background index sync on every readable index store
+// collected at construction, returning true if any started a new sync.
+func (s *LokiStore) TriggerSync() bool {
+	started := false
+	for _, sf := range s.syncerFlushers {
+		if sf.TriggerSync() {
+			started = true
+		}
+	}
+	return started
+}
+
+// SyncStatuses reports the sync status of each per-period index store, labeled
+// with that store's name -- one entry per index the store syncs.
+func (s *LokiStore) SyncStatuses() []index.SyncStatus {
+	statuses := make([]index.SyncStatus, 0, len(s.syncerFlushers))
+	for _, sf := range s.syncerFlushers {
+		st := sf.SyncStatus()
+		st.Name = sf.name
+		statuses = append(statuses, st)
+	}
+	return statuses
+}
+
 func (s *LokiStore) init() error {
 	for i, p := range s.schemaCfg.Configs {
 		chunkClient, err := s.chunkClientForPeriod(p)
 		if err != nil {
 			return err
 		}
-		f, err := fetcher.New(s.chunksCache, s.chunksCacheL2, s.storeCfg.ChunkCacheStubs(), s.schemaCfg, chunkClient, s.storeCfg.L2ChunkCacheHandoff, s.storeCfg.SkipQueryWritebackOlderThan)
+		f, err := fetcher.New(s.chunksCache, s.chunksCacheL2, s.storeCfg.ChunkCacheStubs(), s.schemaCfg, chunkClient, s.storeCfg.L2ChunkCacheHandoff, s.storeCfg.SkipQueryWritebackOlderThan, s.storeCfg.PropagateChunkFetchErrors)
 		if err != nil {
 			return err
 		}
@@ -257,9 +321,27 @@ func (s *LokiStore) storeForPeriod(p config.PeriodConfig, tableRange config.Tabl
 	}
 
 	name := fmt.Sprintf("%s_%s", p.ObjectType, p.From.String())
-	indexReaderWriter, stopTSDBStoreFunc, err := tsdb.NewStore(name, p.IndexTables.PathPrefix, s.cfg.TSDBShipperConfig, s.schemaCfg, f, objectClient, s.limits, tableRange, indexClientReg, indexClientLogger)
+	indexReaderWriter, stopTSDBStoreFunc, err := tsdb.NewStore(name, p.IndexTables.PathPrefix, s.cfg.TSDBShipperConfig, s.schemaCfg, f, objectClient, s.limits, tableRange, indexClientReg, s.registerer, indexClientLogger)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	// Collect the TSDB index store's on-demand capabilities -- flushing the
+	// in-memory head to object storage (used by the ingester) and refreshing the
+	// listing + downloading newly shipped indexes (used by the index-gateway) --
+	// captured here before the monitored-reader-writer wrap, which implements
+	// neither.
+	//
+	// We deliberately keep these off the index.Reader/Writer/ReaderWriter
+	// interfaces: those are also implemented by stores with nothing to flush or
+	// sync -- e.g. the read-only index-gateway client store (which only stubs
+	// IndexChunk) and the monitored wrapper -- so putting them there would force
+	// meaningless no-ops onto every store. Instead we treat them as optional
+	// capabilities and collect only the stores that implement them. The TSDB store
+	// (today the only such store) implements both, so a single syncerFlusher
+	// assertion collects it for both uses.
+	if sf, ok := indexReaderWriter.(syncerFlusher); ok {
+		s.syncerFlushers = append(s.syncerFlushers, namedSyncerFlusher{name: name, syncerFlusher: sf})
 	}
 
 	indexReaderWriter = index.NewMonitoredReaderWriter(indexReaderWriter, indexClientReg)
@@ -341,10 +423,19 @@ func (s *LokiStore) lazyChunks(
 	from, through model.Time,
 	predicate chunk.Predicate,
 	storeChunksOverride *logproto.ChunkRefGroup,
+	hintRanges iter.HintTimeRanges,
 ) ([]*LazyChunk, error) {
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	if hintRanges.Enabled() {
+		hintFrom, hintThrough, ok := hintRanges.Bounds()
+		if !ok {
+			return nil, nil
+		}
+		from, through = util.RoundToMilliseconds(hintFrom, hintThrough)
 	}
 
 	stats := stats.FromContext(ctx)
@@ -363,6 +454,7 @@ func (s *LokiStore) lazyChunks(
 		prefiltered += len(chks[i])
 		stats.AddChunksRef(int64(len(chks[i])))
 		chks[i] = filterChunksByTime(from, through, chks[i])
+		chks[i] = filterChunksByHintRanges(chks[i], hintRanges)
 		filtered += len(chks[i])
 	}
 
@@ -387,12 +479,24 @@ func (s *LokiStore) SelectSeries(ctx context.Context, req logql.SelectLogParams)
 	if err != nil {
 		return nil, err
 	}
+	// decodeReq resolves matchers from Plan.AST only. Callers that have not been
+	// migrated yet set the deprecated Selector field instead, so parse it into a plan.
+	if (req.Plan == nil || req.Plan.AST == nil) && req.Selector != "" {
+		expr, err := syntax.ParseExpr(req.Selector)
+		if err != nil {
+			return nil, err
+		}
+		cpy := *req.QueryRequest
+		cpy.Plan = &plan.QueryPlan{AST: expr}
+		req = logql.SelectLogParams{QueryRequest: &cpy}
+	}
+
 	var from, through model.Time
 	var matchers []*labels.Matcher
 
 	// The Loki parser doesn't allow for an empty label matcher but for the Series API
 	// we allow this to select all series in the time range.
-	if req.Selector == "" {
+	if req.Plan == nil || req.Plan.AST == nil {
 		from, through = util.RoundToMilliseconds(req.Start, req.End)
 		nameLabelMatcher, err := labels.NewMatcher(labels.MatchEqual, model.MetricNameLabel, "logs")
 		if err != nil {
@@ -429,7 +533,8 @@ func (s *LokiStore) SelectLogs(ctx context.Context, req logql.SelectLogParams) (
 		return nil, err
 	}
 
-	lazyChunks, err := s.lazyChunks(ctx, from, through, chunk.NewPredicate(matchers, req.Plan), req.GetStoreChunks())
+	hintRanges := iter.NewHintTimeRanges(req.GetHintRanges(), req.Start, req.End)
+	lazyChunks, err := s.lazyChunks(ctx, from, through, chunk.NewPredicate(matchers, req.Plan), req.GetStoreChunks(), hintRanges)
 	if err != nil {
 		return nil, err
 	}
@@ -467,7 +572,7 @@ func (s *LokiStore) SelectLogs(ctx context.Context, req logql.SelectLogParams) (
 		chunkFilterer = s.chunkFilterer.ForRequest(ctx)
 	}
 
-	return newLogBatchIterator(ctx, s.schemaCfg, s.chunkMetrics, lazyChunks, s.cfg.MaxChunkBatchSize, matchers, pipeline, req.Direction, req.Start, req.End, chunkFilterer)
+	return newLogBatchIterator(ctx, s.schemaCfg, s.chunkMetrics, lazyChunks, s.cfg.MaxChunkBatchSize, matchers, pipeline, req.Direction, req.Start, req.End, chunkFilterer, hintRanges)
 }
 
 func (s *LokiStore) SelectSamples(ctx context.Context, req logql.SelectSampleParams) (iter.SampleIterator, error) {
@@ -476,7 +581,8 @@ func (s *LokiStore) SelectSamples(ctx context.Context, req logql.SelectSamplePar
 		return nil, err
 	}
 
-	lazyChunks, err := s.lazyChunks(ctx, from, through, chunk.NewPredicate(matchers, req.Plan), req.GetStoreChunks())
+	hintRanges := iter.NewHintTimeRanges(req.GetHintRanges(), req.Start, req.End)
+	lazyChunks, err := s.lazyChunks(ctx, from, through, chunk.NewPredicate(matchers, req.Plan), req.GetStoreChunks(), hintRanges)
 	if err != nil {
 		return nil, err
 	}
@@ -490,28 +596,33 @@ func (s *LokiStore) SelectSamples(ctx context.Context, req logql.SelectSamplePar
 		return nil, err
 	}
 
-	extractors, err := expr.Extractors()
+	extractor, err := expr.Extractor()
+	if err != nil {
+		return nil, err
+	}
+	// A literal or a vector expression produces samples without reading logs, so its
+	// extractor is nil and there is no chunk worth touching. The plan is
+	// caller-supplied, so guard rather than assume such a request never arrives.
+	//
+	// Guard before SetupExtractor: given deletes it wraps the nil extractor into a
+	// non-nil filtering one, and this check would stop firing.
+	if extractor == nil {
+		return iter.NoopSampleIterator, nil
+	}
+
+	extractor, err = deletion.SetupExtractor(req, extractor)
 	if err != nil {
 		return nil, err
 	}
 
-	for i, extractor := range extractors {
-		extractor, err = deletion.SetupExtractor(req, extractor)
+	if s.extractorWrapper != nil &&
+		httpreq.ExtractHeader(ctx, httpreq.LokiDisablePipelineWrappersHeader) != "true" {
+		userID, err := tenant.TenantID(ctx)
 		if err != nil {
 			return nil, err
 		}
 
-		if s.extractorWrapper != nil &&
-			httpreq.ExtractHeader(ctx, httpreq.LokiDisablePipelineWrappersHeader) != "true" {
-			userID, err := tenant.TenantID(ctx)
-			if err != nil {
-				return nil, err
-			}
-
-			extractor = s.extractorWrapper.Wrap(ctx, extractor, req.Plan.String(), userID)
-		}
-
-		extractors[i] = extractor
+		extractor = s.extractorWrapper.Wrap(ctx, extractor, req.Plan.String(), userID)
 	}
 
 	var chunkFilterer chunk.Filterer
@@ -519,18 +630,40 @@ func (s *LokiStore) SelectSamples(ctx context.Context, req logql.SelectSamplePar
 		chunkFilterer = s.chunkFilterer.ForRequest(ctx)
 	}
 
-	return newSampleBatchIterator(
-		ctx,
-		s.schemaCfg,
-		s.chunkMetrics,
-		lazyChunks,
-		s.cfg.MaxChunkBatchSize,
-		matchers,
-		req.Start,
-		req.End,
-		chunkFilterer,
-		extractors...,
-	)
+	switch req.Order {
+	case logproto.SAMPLE_ORDER_BY_TIMESTAMP:
+		return newTimestampFirstSampleBatchIterator(
+			ctx,
+			s.schemaCfg,
+			s.chunkMetrics,
+			lazyChunks,
+			s.cfg.MaxChunkBatchSize,
+			matchers,
+			req.Start,
+			req.End,
+			chunkFilterer,
+			extractor,
+			hintRanges,
+		)
+	case logproto.SAMPLE_ORDER_BY_STREAM:
+		return newStreamFirstSampleBatchIterator(
+			ctx,
+			s.schemaCfg,
+			s.chunkMetrics,
+			lazyChunks,
+			s.cfg.MaxChunkBatchSize,
+			matchers,
+			req.Start,
+			req.End,
+			chunkFilterer,
+			streamFirstPrefetchConcurrency(s.cfg.MaxParallelGetChunk, s.cfg.MaxChunkBatchSize),
+			fetchLazyChunks,
+			extractor,
+			hintRanges,
+		)
+	default:
+		return nil, fmt.Errorf("unknown sample order %v", req.Order)
+	}
 }
 
 func (s *LokiStore) GetSchemaConfigs() []config.PeriodConfig {
@@ -544,6 +677,20 @@ func filterChunksByTime(from, through model.Time, chunks []chunk.Chunk) []chunk.
 			continue
 		}
 		filtered = append(filtered, chunk)
+	}
+	return filtered
+}
+
+func filterChunksByHintRanges(chunks []chunk.Chunk, hintRanges iter.HintTimeRanges) []chunk.Chunk {
+	if !hintRanges.Enabled() {
+		return chunks
+	}
+
+	filtered := make([]chunk.Chunk, 0, len(chunks))
+	for _, chk := range chunks {
+		if hintRanges.OverlapsClosed(chk.From.Time(), chk.Through.Time()) {
+			filtered = append(filtered, chk)
+		}
 	}
 	return filtered
 }

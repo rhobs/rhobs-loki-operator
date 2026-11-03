@@ -2,6 +2,7 @@ package querier
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -172,8 +173,17 @@ func (q *IngesterQuerier) forAllIngesters(ctx context.Context, f func(context.Co
 		if err != nil {
 			return nil, err
 		}
-		tenantShards := q.getShardCountForTenant(tenantID)
-		subring, err := q.partitionRing.ShuffleShardWithLookback(tenantID, tenantShards, q.querierConfig.QueryIngestersWithin, time.Now())
+		shardSize := q.getShardCountForTenant(tenantID)
+		// When the tenant has no configured shard size, share a single subring
+		// across all such tenants by using a fixed identifier. The resulting set
+		// of partitions is tenant-independent when size == 0, so per-tenant
+		// shuffle sharding would just waste CPU and cache memory recomputing the
+		// same answer.
+		shuffleShardIdentifier := tenantID
+		if shardSize == 0 {
+			shuffleShardIdentifier = ""
+		}
+		subring, err := q.partitionRing.ShuffleShardWithLookback(shuffleShardIdentifier, shardSize, q.querierConfig.QueryIngestersWithin, time.Now())
 		if err != nil {
 			return nil, err
 		}
@@ -248,6 +258,18 @@ func (q *IngesterQuerier) SelectLogs(ctx context.Context, params logql.SelectLog
 }
 
 func (q *IngesterQuerier) SelectSample(ctx context.Context, params logql.SelectSampleParams) ([]iter.SampleIterator, error) {
+	// Resolve the decoder before the fan-out, so an unknown order fails without opening a gRPC
+	// stream per ingester that nothing then reads.
+	var newClientIterator func(iter.QuerySampleClient) iter.SampleIterator
+	switch params.Order {
+	case logproto.SAMPLE_ORDER_BY_TIMESTAMP:
+		newClientIterator = iter.NewTimestampFirstSampleQueryClientIterator
+	case logproto.SAMPLE_ORDER_BY_STREAM:
+		newClientIterator = iter.NewStreamFirstSampleQueryClientIterator
+	default:
+		return nil, fmt.Errorf("unknown sample order %v", params.Order)
+	}
+
 	resps, err := q.forAllIngesters(ctx, func(_ context.Context, client logproto.QuerierClient) (interface{}, error) {
 		stats.FromContext(ctx).AddIngesterReached(1)
 		return client.QuerySample(ctx, params.SampleQueryRequest)
@@ -258,7 +280,7 @@ func (q *IngesterQuerier) SelectSample(ctx context.Context, params logql.SelectS
 
 	iterators := make([]iter.SampleIterator, len(resps))
 	for i := range resps {
-		iterators[i] = iter.NewSampleQueryClientIterator(resps[i].response.(logproto.Querier_QuerySampleClient))
+		iterators[i] = newClientIterator(resps[i].response.(logproto.Querier_QuerySampleClient))
 	}
 	return iterators, nil
 }

@@ -5,6 +5,7 @@ package streams
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/grafana/loki/v3/pkg/dataobj"
 	"github.com/grafana/loki/v3/pkg/dataobj/sections/internal/columnar"
@@ -80,6 +81,14 @@ func (s *Section) init() error {
 // sections) are skipped.
 func (s *Section) Columns() []*Column { return s.columns }
 
+// NumRows returns the number of rows in the section.
+func (s *Section) NumRows() int {
+	if len(s.columns) == 0 {
+		return 0
+	}
+	return int(s.columns[0].inner.Metadata().RowsCount)
+}
+
 // A Column represents one of the columns in the streams section. Valid columns
 // can only be retrieved by calling [Section.Columns].
 //
@@ -98,6 +107,7 @@ type ColumnType int
 const (
 	ColumnTypeInvalid      ColumnType = iota // ColumnTypeInvalid is an invalid column.
 	ColumnTypeStreamID                       // ColumnTypeStreamID is a column containing a set of stream IDs.
+	ColumnTypeShardBucket                    // ColumnTypeShardBucket contains the shard bucket derived from labels.StableHash(labels).
 	ColumnTypeMinTimestamp                   // ColumnTypeMinTimestamp is a column containing minimum timestamps per stream.
 	ColumnTypeMaxTimestamp                   // ColumnTypeMaxTimestamp is a column containing maximum timestamps per stream.
 
@@ -113,6 +123,7 @@ const (
 var columnTypeNames = map[ColumnType]string{
 	ColumnTypeInvalid:          "invalid",
 	ColumnTypeStreamID:         "stream_id",
+	ColumnTypeShardBucket:      "__shard_bucket__",
 	ColumnTypeMinTimestamp:     "min_timestamp",
 	ColumnTypeMaxTimestamp:     "max_timestamp",
 	ColumnTypeLabel:            "label",
@@ -128,6 +139,8 @@ func ParseColumnType(text string) (ColumnType, error) {
 		return ColumnTypeInvalid, nil
 	case "stream_id":
 		return ColumnTypeStreamID, nil
+	case "__shard_bucket__":
+		return ColumnTypeShardBucket, nil
 	case "min_timestamp":
 		return ColumnTypeMinTimestamp, nil
 	case "max_timestamp":
@@ -150,4 +163,9 @@ func (ct ColumnType) String() string {
 		return fmt.Sprintf("ColumnType(%d)", ct)
 	}
 	return text
+}
+
+// HasColumn reports whether the section holds a column of the given type.
+func (s *Section) HasColumn(typ ColumnType) bool {
+	return slices.ContainsFunc(s.columns, func(column *Column) bool { return column.Type == typ })
 }

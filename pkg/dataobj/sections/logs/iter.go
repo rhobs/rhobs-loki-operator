@@ -41,7 +41,7 @@ func Iter(ctx context.Context, obj *dataobj.Object) result.Seq[Record] {
 
 func IterSection(ctx context.Context, section *Section) result.Seq[Record] {
 	return result.Iter(func(yield func(Record) bool) error {
-		dset, err := MakeColumnarDataset(section)
+		dset, err := section.makeDataset()
 		if err != nil {
 			return fmt.Errorf("creating columnar dataset: %w", err)
 		}
@@ -52,9 +52,9 @@ func IterSection(ctx context.Context, section *Section) result.Seq[Record] {
 		}
 
 		r := dataset.NewRowReader(dataset.RowReaderOptions{
-			Dataset:  dset,
-			Columns:  columns,
-			Prefetch: true,
+			Dataset:           dset,
+			Columns:           columns,
+			PrefetchAllOnOpen: true,
 		})
 		defer r.Close()
 
@@ -62,7 +62,7 @@ func IterSection(ctx context.Context, section *Section) result.Seq[Record] {
 			return err
 		}
 
-		var rows [1]dataset.Row
+		var rows [1024]dataset.Row
 		var record Record
 		for {
 			n, err := r.Read(ctx, rows[:])
@@ -85,29 +85,48 @@ func IterSection(ctx context.Context, section *Section) result.Seq[Record] {
 // ColumnarDataset is the exported type alias of the internal [columnar.Dataset].
 type ColumnarDataset = columnar.Dataset
 
-// MakeColumnarDataset returns the dataset from a section and a set of columns.
-// It returns an error if not all columns are from the provided section.
+// makeDataset builds a dataset from only the recognized columns, so rows stay
+// aligned with Columns() and columns from a newer Loki are skipped, not decoded.
+func (s *Section) makeDataset() (*columnar.Dataset, error) {
+	recognized := s.Columns()
+	inner := make([]*columnar.Column, len(recognized))
+	for i, col := range recognized {
+		inner[i] = col.inner
+	}
+	return columnar.MakeDataset(s.inner, inner)
+}
+
+// MakeColumnarDataset is the exported entry point for sortmerge, the only caller
+// outside this package; internal callers use makeDataset.
 func MakeColumnarDataset(section *Section) (*ColumnarDataset, error) {
-	columnarSection := section.inner
-	return columnar.MakeDataset(columnarSection, columnarSection.Columns())
+	return section.makeDataset()
 }
 
 // DecodeRow decodes a record from a [dataset.Row], using the provided columns
 // to determine the column type. The list of columns must match the columns
 // used to create the row.
 //
+// DecodeRow resets record first, so a field whose column is absent from columns comes back
+// as its zero value rather than keeping what a previous row left there.
+//
 // The sym argument is used for reusing metadata strings between calls to
 // DecodeRow. If sym is nil, metadata strings are always allocated.
 func DecodeRow(columns []*Column, row dataset.Row, record *Record, sym *symbolizer.Symbolizer) error {
+	record.Reset()
+
 	labelBuilder := labelpool.Get()
 	defer labelpool.Put(labelBuilder)
 
 	for columnIndex, columnValue := range row.Values {
-		if columnValue.IsNil() || columnValue.IsZero() {
+		column := columns[columnIndex]
+
+		// Only a nil value is an absent cell. A physical zero is a real value: an INT64 zero
+		// is a timestamp at the Unix epoch, and an empty BINARY is an empty line or an explicitly
+		// empty metadata value. The cases below decode all of those.
+		if columnValue.IsNil() {
 			continue
 		}
 
-		column := columns[columnIndex]
 		switch column.Type {
 		case ColumnTypeStreamID:
 			if ty := columnValue.Type(); ty != datasetmd.PHYSICAL_TYPE_INT64 {
@@ -119,13 +138,15 @@ func DecodeRow(columns []*Column, row dataset.Row, record *Record, sym *symboliz
 			if ty := columnValue.Type(); ty != datasetmd.PHYSICAL_TYPE_INT64 {
 				return fmt.Errorf("invalid type %s for %s", ty, column.Type)
 			}
-			record.Timestamp = time.Unix(0, columnValue.Int64())
+			record.Timestamp = time.Unix(0, columnValue.Int64()).UTC()
 
 		case ColumnTypeMetadata:
 			if ty := columnValue.Type(); ty != datasetmd.PHYSICAL_TYPE_BINARY {
 				return fmt.Errorf("invalid type %s for %s", ty, column.Type)
 			}
 
+			// An empty value is kept as a label. The key is present on the line, it just
+			// holds no value, and the chunk path surfaces that as a distinct label too.
 			if sym != nil {
 				labelBuilder.Add(column.Name, sym.Get(unsafeString(columnValue.Binary())))
 			} else {
@@ -136,6 +157,9 @@ func DecodeRow(columns []*Column, row dataset.Row, record *Record, sym *symboliz
 			if ty := columnValue.Type(); ty != datasetmd.PHYSICAL_TYPE_BINARY {
 				return fmt.Errorf("invalid type %s for %s", ty, column.Type)
 			}
+
+			// An empty line goes through the copy as well, which truncates the field. A
+			// reused Record must not keep the previous row's line.
 			line := columnValue.Binary()
 			record.Line = slicegrow.Copy(record.Line, line)
 		}

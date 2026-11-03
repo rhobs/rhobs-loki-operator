@@ -1226,9 +1226,6 @@ spec:
                   to store logs.
                 properties:
                   schemas:
-                    default:
-                    - effectiveDate: "2020-10-11"
-                      version: v11
                     description: Schemas for reading and writing logs.
                     items:
                       description: ObjectStorageSchema defines a schema version and
@@ -1308,6 +1305,7 @@ spec:
                     - caName
                     type: object
                 required:
+                - schemas
                 - secret
                 type: object
               storageClassName:
@@ -4589,13 +4587,25 @@ spec:
                   - type
                   type: object
                 type: array
-              networkPolicyRuleSet:
-                description: NetworkPolicyRuleSet indicates which NetworkPolicies
-                  ruleset was applied by the operator for this LokiStack.
-                enum:
-                - None
-                - RestrictIngressEgress
-                type: string
+              networkPolicyStatus:
+                description: NetworkPolicyStatus provides details about the applied
+                  NetworkPolicies configuration
+                properties:
+                  objectStorageAllowedEgressPorts:
+                    description: ObjectStorageAllowedEgressPorts contains the TCP
+                      ports allowed for egress to object storage endpoints.
+                    items:
+                      format: int32
+                      type: integer
+                    type: array
+                  ruleSet:
+                    description: RuleSet indicates which NetworkPolicies ruleset was
+                      applied by the operator for this LokiStack.
+                    enum:
+                    - None
+                    - RestrictIngressEgress
+                    type: string
+                type: object
               storage:
                 description: |-
                   Storage provides summary of all changes that have occurred

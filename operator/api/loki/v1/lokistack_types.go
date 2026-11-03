@@ -658,9 +658,13 @@ type ObjectStorageSchemaVersion string
 
 const (
 	// ObjectStorageSchemaV11 when using v11 for the storage schema
+	//
+	// Deprecated: ObjectStorageSchemaV11 is deprecated and will no longer reconcile. Use ObjectStorageSchemaV13 instead.
 	ObjectStorageSchemaV11 ObjectStorageSchemaVersion = "v11"
 
 	// ObjectStorageSchemaV12 when using v12 for the storage schema
+	//
+	// Deprecated: ObjectStorageSchemaV12 is deprecated and will no longer reconcile. Use ObjectStorageSchemaV13 instead.
 	ObjectStorageSchemaV12 ObjectStorageSchemaVersion = "v12"
 
 	// ObjectStorageSchemaV13 when using v13 for the storage schema
@@ -693,10 +697,9 @@ type ObjectStorageSchema struct {
 type ObjectStorageSpec struct {
 	// Schemas for reading and writing logs.
 	//
-	// +optional
-	// +kubebuilder:validation:Optional
+	// +required
+	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems:=1
-	// +kubebuilder:default:={{version:v11,effectiveDate:"2020-10-11"}}
 	Schemas []ObjectStorageSchema `json:"schemas"`
 
 	// Secret for object storage authentication.
@@ -1503,6 +1506,8 @@ const (
 	ReasonInvalidGatewayTLSConfig LokiStackConditionReason = "InvalidGatewayTLSConfig"
 	// ReasonInvalidPassthroughConfiguration when the passthrough configuration is invalid.
 	ReasonInvalidPassthroughConfiguration LokiStackConditionReason = "InvalidPassthroughConfiguration"
+	// ReasonMissingPassthroughConfiguration when the passthrough configuration is missing.
+	ReasonMissingPassthroughConfiguration LokiStackConditionReason = "MissingPassthroughConfiguration"
 	// ReasonMissingGatewayOpenShiftBaseDomain when the reconciler cannot lookup the OpenShift DNS base domain.
 	ReasonMissingGatewayOpenShiftBaseDomain LokiStackConditionReason = "MissingGatewayOpenShiftBaseDomain"
 	// ReasonFailedCertificateRotation when the reconciler cannot rotate any of the required TLS certificates.
@@ -1640,6 +1645,21 @@ type LokiStackStorageStatus struct {
 	CredentialMode CredentialMode `json:"credentialMode,omitempty"`
 }
 
+// LokiStackNetworkPolicyStatus defines the observed network policy configuration
+type LokiStackNetworkPolicyStatus struct {
+	// RuleSet indicates which NetworkPolicies ruleset was applied by the operator for this LokiStack.
+	//
+	// +optional
+	// +kubebuilder:validation:Optional
+	RuleSet NetworkPolicyRuleSet `json:"ruleSet,omitempty"`
+
+	// ObjectStorageAllowedEgressPorts contains the TCP ports allowed for egress to object storage endpoints.
+	//
+	// +optional
+	// +kubebuilder:validation:Optional
+	ObjectStorageAllowedEgressPorts []int32 `json:"objectStorageAllowedEgressPorts,omitempty"`
+}
+
 // LokiStackStatus defines the observed state of LokiStack
 type LokiStackStatus struct {
 	// Components provides summary of all Loki pod status grouped
@@ -1656,11 +1676,11 @@ type LokiStackStatus struct {
 	// +kubebuilder:validation:Optional
 	Storage LokiStackStorageStatus `json:"storage,omitempty"`
 
-	// NetworkPolicyRuleSet indicates which NetworkPolicies ruleset was applied by the operator for this LokiStack.
+	// NetworkPolicyStatus provides details about the applied NetworkPolicies configuration
 	//
 	// +optional
 	// +kubebuilder:validation:Optional
-	NetworkPolicyRuleSet NetworkPolicyRuleSet `json:"networkPolicyRuleSet,omitempty"`
+	NetworkPolicyStatus LokiStackNetworkPolicyStatus `json:"networkPolicyStatus,omitempty"`
 
 	// Conditions of the Loki deployment health.
 	//
