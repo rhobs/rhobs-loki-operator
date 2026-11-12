@@ -1,3 +1,5 @@
-production/docker/.data
-.cache
-tools/dev/kafka/data
+# More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
+# Ignore all files which are not go type
+!**/*.go
+!**/*.mod
+!**/*.sum
